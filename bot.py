@@ -43,12 +43,18 @@ try:
 except Exception:
     HAS_SAFONE = False
 
-# Optional dataframes
+# Optional dataframes + PDF parsing
 try:
     import pandas as pd
     HAS_PANDAS = True
 except Exception:
     HAS_PANDAS = False
+
+try:
+    import pdfplumber
+    HAS_PDF = True
+except Exception:
+    HAS_PDF = False
 
 # ---------- Config ----------
 load_dotenv()
@@ -191,7 +197,7 @@ def parse_date_fuzzy(s: str) -> Optional[datetime]:
     return None
 
 def canonical(s: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", s.lower())).strip()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower())).strip()
 
 # ---------- Data ops ----------
 def add_expense(user_id: int, amount: float, note: Optional[str], category: Optional[str]) -> int:
@@ -409,7 +415,6 @@ async def delete_old_bot_messages(chat_id: int, keep_last: int = 0):
     con = db(); cur = con.cursor()
     cur.execute("SELECT id, msg_id FROM bot_msgs WHERE user_id=? AND chat_id=? ORDER BY id DESC", (OWNER_ID, chat_id))
     rows = cur.fetchall(); con.close()
-    # skip latest N
     for i, r in enumerate(rows):
         if i < keep_last:
             continue
@@ -417,7 +422,6 @@ async def delete_old_bot_messages(chat_id: int, keep_last: int = 0):
             await bot.delete_message(chat_id, r["msg_id"])
         except Exception:
             pass
-    # clear log (fresh start)
     con = db(); cur = con.cursor()
     cur.execute("DELETE FROM bot_msgs WHERE user_id=? AND chat_id=?", (OWNER_ID, chat_id))
     con.commit(); con.close()
@@ -547,7 +551,6 @@ async def send_photo(chat_id: int, photo_bytes: bytes, filename: str, caption: s
     return msg
 
 async def safe_edit(message, text: str, kb=None):
-    """Use edit_text, but fallback to sending a new message if 'not modified'."""
     try:
         await message.edit_text(text, reply_markup=kb)
     except TelegramBadRequest as e:
@@ -597,7 +600,7 @@ def person_menu_kb(pid: int):
     kb.button(text="💠 Set Interest %", callback_data=f"setinterest:{pid}")
     kb.button(text="🗒 Ledger", callback_data=f"ledger:{pid}")
     kb.button(text="📄 Export", callback_data=f"export_person:{pid}")
-    kb.button(text="🗑 Remove", callback_data=f"person_delete:{pid}")
+    kb.button(text="🗑 Remove", callback_data=f"person_delete_confirm:{pid}")
     kb.button(text="⬅️ Back", callback_data="people")
     kb.adjust(2,2,2,2)
     return kb.as_markup()
@@ -624,6 +627,20 @@ def reset_confirm_kb():
     kb.button(text="🧼 Yes, reset everything", callback_data="reset_all_do")
     kb.button(text="❌ Cancel", callback_data="back_main")
     kb.adjust(1)
+    return kb.as_markup()
+
+def support_person_kb(pid: int):
+    # Action pad under Support AI
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Lend", callback_data=f"lend:{pid}")
+    kb.button(text="💸 Repay", callback_data=f"repay:{pid}")
+    kb.button(text="🗒 Ledger", callback_data=f"ledger:{pid}")
+    kb.button(text="🎯 Limit", callback_data=f"setlimit:{pid}")
+    kb.button(text="💠 Interest %", callback_data=f"setinterest:{pid}")
+    kb.button(text="📄 Export", callback_data=f"export_person:{pid}")
+    kb.button(text="🗑 Delete", callback_data=f"person_delete_confirm:{pid}")
+    kb.button(text="⬅️ Main", callback_data="back_main")
+    kb.adjust(2,2,2,2)
     return kb.as_markup()
 
 # ---------- States ----------
@@ -677,7 +694,7 @@ async def start_cmd(m: Message):
         init_db(); migrate_defaults()
         # auto-delete old bot messages
         await delete_old_bot_messages(m.chat.id, keep_last=0)
-        msg = await send_text(
+        await send_text(
             m.chat.id,
             "👋 <b>Expense & Lending Assistant</b>\n"
             "• <b>Legend</b>: + means they owe you; – means you owe them.\n"
@@ -705,6 +722,24 @@ async def back_main(c: CallbackQuery):
     except Exception as e:
         await c.message.answer(f"❌ back error: {e}")
 
+# Quick Add Help
+@router.callback_query(F.data == "help_quick")
+async def help_quick(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        txt = (
+            "ℹ️ <b>Quick Add Help</b>\n"
+            "• <code>Ajay +500 cab</code> → Lend ₹500 to Ajay\n"
+            "• <code>Ajay -300 dinner</code> → Repay ₹300 from Ajay\n"
+            "• <code>500 > add to > Ajay</code>\n"
+            "• <code>lend 700 to Raj snacks</code>\n"
+            "• <code>repay 200 from Raj</code>\n"
+            "• AI Support understands: <i>who is Ajay</i>, <i>what’s with Raj</i>, <i>how much do I owe Ajay</i>."
+        )
+        await send_text(c.message.chat.id, txt, main_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ help error: {e}")
+
 # Add Expense
 EXP_CATS = ["Food","Travel","Bills","Other","✍️ Custom"]
 
@@ -713,7 +748,8 @@ async def cb_add_expense(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
         await state.set_state(AddExpenseStates.waiting_amount)
-        await safe_edit(c.message, "➕ Enter expense amount (number):", None); await c.answer()
+        await send_text(c.message.chat.id, "➕ Enter expense amount (number):")
+        await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ expense error: {e}")
 
@@ -765,20 +801,34 @@ async def exp_custom_cat(m: Message, state: FSMContext):
 async def skip_note_cb(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
-        cur = await state.get_state()
-        # emulate "skip" for any waiting_note state
-        if cur in {AddExpenseStates.waiting_note.state,
-                   LendStates.waiting_note.state,
-                   RepayStates.waiting_note.state}:
-            # forward a fake "skip" message into the same handler path
-            fake = Message(message_id=c.message.message_id, date=c.message.date, chat=c.message.chat, from_user=c.from_user)
-            fake.text = "skip"
-            if cur == AddExpenseStates.waiting_note.state:
-                await get_exp_note(fake, state)
-            elif cur == LendStates.waiting_note.state:
-                await lend_note(fake, state)
-            else:
-                await repay_note(fake, state)
+        st = await state.get_state()
+        data = await state.get_data()
+        # Expense → finalize immediately
+        if st == AddExpenseStates.waiting_note.state:
+            eid = add_expense(OWNER_ID, data["amount"], None, data.get("category"))
+            log_action(OWNER_ID, "expense", "expenses", eid)
+            await state.clear()
+            total = monthly_total(OWNER_ID)
+            await send_text(c.message.chat.id,
+                f"✅ Expense saved: {CURRENCY}{data['amount']:,.2f} [{data.get('category','Other')}]\n"
+                f"🧮 This month: {CURRENCY}{total:,.2f}",
+                main_kb()
+            )
+        # Lend → go to due date step
+        elif st == LendStates.waiting_note.state:
+            await state.update_data(note=None)
+            await state.set_state(LendStates.waiting_due)
+            await send_text(c.message.chat.id, "📅 Optional due date (YYYY-MM-DD) or type <code>skip</code>")
+        # Repay → finalize immediately
+        elif st == RepayStates.waiting_note.state:
+            lid = add_ledger(OWNER_ID, data["person_id"], "repay", data["amount"], None)
+            log_action(OWNER_ID, "ledger", "ledger", lid)
+            await state.clear()
+            bal = person_balance(OWNER_ID, data["person_id"])
+            await send_text(c.message.chat.id,
+                            f"✅ Repay saved: {CURRENCY}{data['amount']:,.2f}\n"
+                            f"💼 New balance: {CURRENCY}{bal:,.2f}",
+                            people_kb(OWNER_ID))
         await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ skip error: {e}")
@@ -806,7 +856,7 @@ async def get_exp_note(m: Message, state: FSMContext):
 async def cb_people(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
-        await safe_edit(c.message, "👥 <b>People</b>\n(+ means they owe you)", people_kb(OWNER_ID)); await c.answer()
+        await send_text(c.message.chat.id, "👥 <b>People</b>\n(+ means they owe you)", people_kb(OWNER_ID)); await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ people error: {e}")
 
@@ -815,7 +865,8 @@ async def cb_person_add(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
         await state.set_state(AddPersonStates.waiting_name)
-        await safe_edit(c.message, "👤 Send the person’s name to add:", None); await c.answer()
+        await send_text(c.message.chat.id, "👤 Send the person’s name to add:")
+        await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ person add error: {e}")
 
@@ -848,9 +899,34 @@ async def cb_person_menu(c: CallbackQuery):
                 f"💼 Balance: <b>{CURRENCY}{bal:,.2f}</b>\n"
                 f"🎯 Limit: {'' if limit is not None else '(not set) '}{CURRENCY}{(limit or 0):,.2f}\n"
                 f"💠 Interest: {rate if rate is not None else 0:.2f}% / month")
-        await safe_edit(c.message, text, person_menu_kb(pid)); await c.answer()
+        await send_text(c.message.chat.id, text, person_menu_kb(pid)); await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ person menu error: {e}")
+
+# Delete person with confirmation (fix)
+@router.callback_query(F.data.startswith("person_delete_confirm:"))
+async def person_delete_confirm(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        pid = int(c.data.split(":")[1])
+        await send_text(c.message.chat.id, "⚠️ Delete this person and all related ledger?", 
+                        InlineKeyboardBuilder()
+                        .button(text="🗑 Yes, delete", callback_data=f"person_delete_do:{pid}")
+                        .button(text="❌ Cancel", callback_data=f"person_menu:{pid}")
+                        .adjust(1).as_markup())
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ delete confirm error: {e}")
+
+@router.callback_query(F.data.startswith("person_delete_do:"))
+async def person_delete_do(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        pid = int(c.data.split(":")[1])
+        delete_person(OWNER_ID, pid)
+        await send_text(c.message.chat.id, "🗑 Deleted. Back to people list.", people_kb(OWNER_ID)); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ person delete error: {e}")
 
 # Lend with due date
 @router.callback_query(F.data.startswith("lend:"))
@@ -859,7 +935,8 @@ async def cb_lend(c: CallbackQuery, state: FSMContext):
         if not only_owner(c): return await c.message.answer(deny_text())
         pid = int(c.data.split(":")[1])
         await state.set_state(LendStates.waiting_amount); await state.update_data(person_id=pid)
-        await safe_edit(c.message, "➕ Enter LEND amount (they owe you):", None); await c.answer()
+        await send_text(c.message.chat.id, "➕ Enter LEND amount (they owe you):")
+        await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ lend error: {e}")
 
@@ -919,7 +996,8 @@ async def cb_repay(c: CallbackQuery, state: FSMContext):
         if not only_owner(c): return await c.message.answer(deny_text())
         pid = int(c.data.split(":")[1])
         await state.set_state(RepayStates.waiting_amount); await state.update_data(person_id=pid)
-        await safe_edit(c.message, "💸 Enter REPAY amount (they returned to you):", None); await c.answer()
+        await send_text(c.message.chat.id, "💸 Enter REPAY amount (they returned to you):")
+        await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ repay error: {e}")
 
@@ -981,7 +1059,8 @@ async def cb_setlimit(c: CallbackQuery, state: FSMContext):
         if not only_owner(c): return await c.message.answer(deny_text())
         pid = int(c.data.split(":")[1])
         await state.set_state(LimitState.waiting_amount); await state.update_data(person_id=pid)
-        await safe_edit(c.message, "🎯 Send limit amount (number) or <code>0</code> to clear.", None); await c.answer()
+        await send_text(c.message.chat.id, "🎯 Send limit amount (number) or <code>0</code> to clear.")
+        await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ setlimit error: {e}")
 
@@ -1006,7 +1085,8 @@ async def cb_setinterest(c: CallbackQuery, state: FSMContext):
         if not only_owner(c): return await c.message.answer(deny_text())
         pid = int(c.data.split(":")[1])
         await state.set_state(InterestState.waiting_rate); await state.update_data(person_id=pid)
-        await safe_edit(c.message, "💠 Send monthly interest rate in % (e.g., 2 for 2%). Use 0 to clear.", None); await c.answer()
+        await send_text(c.message.chat.id, "💠 Send monthly interest rate in % (e.g., 2 for 2%). Use 0 to clear.")
+        await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ setinterest error: {e}")
 
@@ -1051,7 +1131,7 @@ async def cb_ledger(c: CallbackQuery):
             text = (f"🗒 <b>{name}</b> (last {len(last)} of {len(rows)})\n" +
                     "\n".join(lines) +
                     f"\n\n💼 Balance: <b>{CURRENCY}{bal:,.2f}</b>")
-        await safe_edit(c.message, text, person_menu_kb(pid)); await c.answer()
+        await send_text(c.message.chat.id, text, person_menu_kb(pid)); await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ ledger error: {e}")
 
@@ -1083,7 +1163,7 @@ async def cb_export_all(c: CallbackQuery):
     except Exception as e:
         await c.message.answer(f"❌ export all error: {e}")
 
-# Monthly + Category chart (independent replies to avoid 'not modified')
+# Monthly + Category chart (independent)
 @router.callback_query(F.data == "monthly")
 async def cb_monthly(c: CallbackQuery):
     try:
@@ -1117,7 +1197,7 @@ async def cb_cat_chart(c: CallbackQuery):
     except Exception as e:
         await c.message.answer(f"❌ chart error: {e}")
 
-# Due Soon (independent)
+# Due Soon
 @router.callback_query(F.data == "due_soon")
 async def cb_due_soon(c: CallbackQuery):
     try:
@@ -1174,7 +1254,8 @@ async def ask_daily_hour(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
         await state.set_state(DailyHourState.waiting_hour)
-        await safe_edit(c.message, "🕘 Send daily reminder hour (0-23 IST):", None); await c.answer()
+        await send_text(c.message.chat.id, "🕘 Send daily reminder hour (0-23 IST):")
+        await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ set hour error: {e}")
 
@@ -1196,7 +1277,8 @@ async def ask_weekly_dow(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
         await state.set_state(WeeklyDowState.waiting_dow)
-        await safe_edit(c.message, "📅 Send weekly day number (0=Mon .. 6=Sun):", None); await c.answer()
+        await send_text(c.message.chat.id, "📅 Send weekly day number (0=Mon .. 6=Sun):")
+        await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ set dow error: {e}")
 
@@ -1249,16 +1331,16 @@ async def reset_all_do(c: CallbackQuery):
     except Exception as e:
         await c.message.answer(f"❌ reset error: {e}")
 
-# ---------- IMPORT SHEET ----------
+# ---------- IMPORT SHEET (CSV/XLSX/PDF) ----------
 @router.callback_query(F.data == "import_sheet")
 async def cb_import_sheet(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
         await state.set_state(ImportState.waiting_file)
         await send_text(c.message.chat.id,
-            "📥 <b>Import Sheet</b>\n"
-            "Upload a CSV or XLSX (export from Google Sheets).\n"
-            "Supported columns:\n"
+            "📥 <b>Import</b>\n"
+            "Upload CSV / XLSX / PDF (tables). From Google Sheets → Export CSV/XLSX.\n"
+            "Columns:\n"
             "• Expenses: date, amount, note, category\n"
             "• Ledger: person, type(lend|repay), amount, note, duedate\n"
             "If type is missing: positive=lend, negative=repay."
@@ -1367,8 +1449,22 @@ async def handle_import_file(m: Message, state: FSMContext):
                     df = x.parse(s)
                     await _ingest_dataframe(df, results)
                     results["sheets"] += 1
+            elif suffix.endswith(".pdf"):
+                if not (HAS_PANDAS and HAS_PDF):
+                    return await m.answer("⚠️ Install pandas + pdfplumber to import PDF tables.")
+                with pdfplumber.open(dest) as pdf:
+                    for page in pdf.pages:
+                        tables = page.extract_tables()
+                        for t in tables:
+                            if not t or len(t) < 2: 
+                                continue
+                            header = t[0]
+                            rows = t[1:]
+                            df = pd.DataFrame(rows, columns=header)
+                            await _ingest_dataframe(df, results)
+                            results["sheets"] += 1
             else:
-                return await m.answer("⚠️ Please upload a CSV or XLSX file.")
+                return await m.answer("⚠️ Upload CSV / XLSX / PDF.")
         except Exception as e:
             return await m.answer(f"❌ Import failed: {e}")
 
@@ -1387,40 +1483,62 @@ async def handle_import_file(m: Message, state: FSMContext):
     except Exception as e:
         await m.answer(f"❌ import handler error: {e}")
 
-# ---------- SUPPORT (AI) ----------
+# ---------- SUPPORT (AI) — “Support” that can manage everything ----------
 @router.callback_query(F.data == "support_ai")
 async def cb_support_ai(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
         await state.set_state(SupportAIState.waiting_query)
         await send_text(c.message.chat.id,
-            "🧑‍🤝‍🧑 <b>Support Assistant</b>\n"
-            "Ask me: ‘how much do I owe Ajay?’, ‘Ajay balance’, ‘monthly spend’, ‘due soon’, ‘ledger Ajay’, etc."
-        )
+            "🧑‍🤝‍🧑 <b>Support</b>\n"
+            "Ask me anything about your data: ‘who is Raj’, ‘what’s with Raj’, ‘how much do I owe Ajay’, "
+            "‘lend 500 to Raj’, ‘ledger Ajay’, ‘delete Raj’, ‘monthly spend’, ‘due soon’, etc.")
         await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ support ui error: {e}")
 
 def _nl_intent(q: str):
     s = canonical(q)
-    # direct keywords
+
+    # high-level
     if "monthly" in s and ("spend" in s or "expense" in s):
         return ("monthly_spend", None)
     if "due" in s or "overdue" in s or "due soon" in s:
         return ("due_soon", None)
-    # patterns for balance / owe
-    # capture trailing name after 'owe', 'owe to', 'balance', 'with'
-    m = re.search(r"(?:owe to|owe|balance(?: with| of| for)?|how much .* owe to?)\s+([a-z0-9 ._-]{2,})", s)
-    if not m:
-        # "ajay balance", "ajay owes me", "i owe ajay"
-        m = re.search(r"^([a-z0-9 ._-]{2,})\s+(?:balance|owes me|i owe)$", s)
-    person = m.group(1).strip() if m else None
-    if person:
-        return ("balance_person", person)
-    # ledger
-    m2 = re.search(r"(?:ledger|history|statement)\s+(?:of|for)?\s*([a-z0-9 ._-]{2,})", s)
-    if m2:
-        return ("ledger_person", m2.group(1).strip())
+
+    # who/what is X, what's with X
+    m = re.search(r"(?:who is|what is|whats|what'?s|what about|whats with|what with)\s+([a-z0-9 ._-]{2,})", s)
+    if m:
+        return ("person_summary", m.group(1).strip())
+
+    # balance / owe
+    m = re.search(r"(?:balance(?: with| of| for)?|how much .* owe(?: to)?|i owe|owe(?: to)?)\s+([a-z0-9 ._-]{2,})", s)
+    if m:
+        return ("balance_person", m.group(1).strip())
+
+    # operations: delete / remove
+    m = re.search(r"(?:delete|remove)\s+([a-z0-9 ._-]{2,})", s)
+    if m:
+        return ("delete_person", m.group(1).strip())
+
+    # ledger request
+    m = re.search(r"(?:ledger|history|statement)\s+(?:of|for)?\s*([a-z0-9 ._-]{2,})", s)
+    if m:
+        return ("ledger_person", m.group(1).strip())
+
+    # lend/repay forms
+    m = re.search(r"(?:lend|give)\s+(\d+(?:\.\d{1,2})?)\s+(?:to\s+)?([a-z0-9 ._-]{2,})", s)
+    if m:
+        return ("lend_to", (float(m.group(1)), m.group(2).strip()))
+    m = re.search(r"(?:repay|returned?|got)\s+(\d+(?:\.\d{1,2})?)\s+(?:from|by)\s*([a-z0-9 ._-]{2,})", s)
+    if m:
+        return ("repay_from", (float(m.group(1)), m.group(2).strip()))
+
+    # bare name → suggest actions
+    names = [p["display_name"].lower() for p in get_people(OWNER_ID)]
+    for nm in names:
+        if nm in s.split():
+            return ("person_summary", nm)
     return ("unknown", None)
 
 async def ai_explain(prompt: str, base_reply: str, context: str) -> Optional[str]:
@@ -1467,23 +1585,22 @@ async def handle_support_query(m: Message, state: FSMContext):
             await state.clear()
             return await send_text(m.chat.id, extra or base, main_kb())
 
-        if intent in ("balance_person","ledger_person") and arg:
-            pid, disp = resolve_person_id(OWNER_ID, arg)
+        if intent in ("person_summary","balance_person","ledger_person","delete_person"):
+            name = arg
+            pid, disp = resolve_person_id(OWNER_ID, name)
             if not pid:
                 await state.clear()
-                return await send_text(m.chat.id, f"⚠️ Person “{arg}” not found. (Add via 👥 People)", main_kb())
-            if intent == "balance_person":
-                bal = person_balance(OWNER_ID, pid)
-                if bal > 0:
-                    base = f"📌 {disp} owes you <b>{CURRENCY}{bal:,.2f}</b>."
-                elif bal < 0:
-                    base = f"📌 You owe {disp} <b>{CURRENCY}{abs(bal):,.2f}</b>."
-                else:
-                    base = f"📌 You and {disp} are settled (₹0)."
-                extra = await ai_explain(q, base, f"Balance with {disp} is {bal}")
+                return await send_text(m.chat.id, f"⚠️ Person “{name}” not found. (Add via 👥 People)", main_kb())
+
+            if intent == "delete_person":
                 await state.clear()
-                return await send_text(m.chat.id, extra or base, main_kb())
-            else:
+                return await send_text(m.chat.id,
+                    f"⚠️ Delete <b>{disp}</b> and all their data?",
+                    InlineKeyboardBuilder()
+                    .button(text="🗑 Yes, delete", callback_data=f"person_delete_do:{pid}")
+                    .button(text="❌ Cancel", callback_data="back_main").adjust(1).as_markup())
+
+            if intent == "ledger_person":
                 rows = get_ledger(OWNER_ID, pid)
                 if not rows:
                     base = f"🗒 Ledger for <b>{disp}</b> is empty."
@@ -1499,11 +1616,49 @@ async def handle_support_query(m: Message, state: FSMContext):
                     base = (f"🗒 <b>{disp}</b> (last {len(last)} of {len(rows)})\n" +
                             "\n".join(lines) +
                             f"\n\n💼 Balance: <b>{CURRENCY}{bal:,.2f}</b>")
-                extra = await ai_explain(q, base, f"Ledger shown for {disp}.")
                 await state.clear()
-                return await send_text(m.chat.id, extra or base, main_kb())
+                return await send_text(m.chat.id, base, support_person_kb(pid))
 
-        base = "🤖 I can answer: ‘monthly spend’, ‘due soon’, ‘Ajay balance’, ‘how much do I owe Ajay’, or ‘ledger Ajay’."
+            # person_summary / balance_person
+            bal = person_balance(OWNER_ID, pid)
+            rate, _ = get_person_interest_info(OWNER_ID, pid)
+            lim = get_credit_limit(OWNER_ID, pid)
+            due = due_items(OWNER_ID, 30)
+            due_line = ""
+            for r in due:
+                if r["name"].lower() == disp.lower():
+                    due_line = f"\n⏰ Due soon: {CURRENCY}{float(r['amount']):,.2f} by {datetime.fromtimestamp(r['due_ts'], TZ).strftime('%d %b')}"
+                    break
+            if bal > 0:
+                base = f"📇 <b>{disp}</b>\n• Owes you: <b>{CURRENCY}{bal:,.2f}</b>"
+            elif bal < 0:
+                base = f"📇 <b>{disp}</b>\n• You owe: <b>{CURRENCY}{abs(bal):,.2f}</b>"
+            else:
+                base = f"📇 <b>{disp}</b>\n• Settled (₹0)"
+            base += f"\n• Interest: {(rate or 0):.2f}% / mo\n• Limit: {CURRENCY}{(lim or 0):,.2f}{due_line}\n\nHow can I help with {disp}?"
+            extra = await ai_explain(q, base, f"{disp} summary with balance {bal}")
+            await state.clear()
+            return await send_text(m.chat.id, extra or base, support_person_kb(pid))
+
+        if intent in ("lend_to","repay_from"):
+            amt, name = arg
+            pid, disp = resolve_person_id(OWNER_ID, name)
+            if not pid:
+                await state.clear()
+                return await send_text(m.chat.id, f"⚠️ Person “{name}” not found. (Add via 👥 People)", main_kb())
+            if intent == "lend_to":
+                lid = add_ledger(OWNER_ID, pid, "lend", amt, "via Support")
+            else:
+                lid = add_ledger(OWNER_ID, pid, "repay", amt, "via Support")
+            log_action(OWNER_ID, "ledger", "ledger", lid)
+            bal = person_balance(OWNER_ID, pid)
+            await state.clear()
+            return await send_text(m.chat.id,
+                f"✅ {'Lend' if intent=='lend_to' else 'Repay'} {CURRENCY}{amt:,.2f} {'to' if intent=='lend_to' else 'from'} <b>{disp}</b>\n"
+                f"💼 Balance: {CURRENCY}{bal:,.2f}", support_person_kb(pid))
+
+        # unknown → nudge + AI assist
+        base = "🤖 I can: ‘who is Raj’, ‘what’s with Raj’, ‘Ajay balance’, ‘lend 500 to Raj’, ‘delete Ajay’, ‘monthly spend’, ‘due soon’, ‘ledger Raj’."
         extra = await ai_explain(q, base, "Help user with supported intents.")
         await state.clear()
         return await send_text(m.chat.id, extra or base, main_kb())
@@ -1535,14 +1690,11 @@ async def catch_all(m: Message):
                 return await m.answer("⚠️ Person not found. Add them first via 👥 People → ➕ Add Person.")
             if sign == "+":
                 lid = add_ledger(OWNER_ID, pid, "lend", amt, note)
-                log_action(OWNER_ID, "ledger", "ledger", lid)
-                bal = person_balance(OWNER_ID, pid)
-                return await send_text(m.chat.id, f"✅ Lend {CURRENCY}{amt:,.2f} to <b>{disp}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}", people_kb(OWNER_ID))
             else:
                 lid = add_ledger(OWNER_ID, pid, "repay", amt, note)
-                log_action(OWNER_ID, "ledger", "ledger", lid)
-                bal = person_balance(OWNER_ID, pid)
-                return await send_text(m.chat.id, f"✅ Repay {CURRENCY}{amt:,.2f} from <b>{disp}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}", people_kb(OWNER_ID))
+            log_action(OWNER_ID, "ledger", "ledger", lid)
+            bal = person_balance(OWNER_ID, pid)
+            return await send_text(m.chat.id, f"✅ {'Lend' if sign=='+' else 'Repay'} {CURRENCY}{amt:,.2f} {'to' if sign=='+' else 'from'} <b>{disp}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}", people_kb(OWNER_ID))
 
         mm = QUICK_RE.match(txt)
         if mm:
@@ -1571,10 +1723,7 @@ async def catch_all(m: Message):
             pid, disp = resolve_person_id(OWNER_ID, name)
             if not pid:
                 return await m.answer("⚠️ Person not found. Add them first via 👥 People → ➕ Add Person.")
-            if lend_mode:
-                lid = add_ledger(OWNER_ID, pid, "lend", amount, note)
-            else:
-                lid = add_ledger(OWNER_ID, pid, "repay", amount, note)
+            lid = add_ledger(OWNER_ID, pid, "lend" if lend_mode else "repay", amount, note)
             log_action(OWNER_ID, "ledger", "ledger", lid)
             bal = person_balance(OWNER_ID, pid)
             return await send_text(m.chat.id, f"✅ {'Lend' if lend_mode else 'Repay'} {CURRENCY}{amount:,.2f} {'to' if lend_mode else 'from'} <b>{disp}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}", people_kb(OWNER_ID))
@@ -1660,7 +1809,7 @@ async def scheduler_loop():
             pass
         await asyncio.sleep(60)
 
-# Proper startup/shutdown registration
+# Startup/shutdown
 @dp.startup.register
 async def on_startup():
     import asyncio
