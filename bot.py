@@ -5,12 +5,13 @@ import os
 import re
 import csv
 import time
+import json
 import zipfile
 import difflib
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -88,7 +89,6 @@ def db():
 
 def init_db():
     con = db(); cur = con.cursor()
-    # expenses
     cur.execute("""
     CREATE TABLE IF NOT EXISTS expenses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,7 +99,6 @@ def init_db():
         note TEXT,
         category TEXT
     )""")
-    # people
     cur.execute("""
     CREATE TABLE IF NOT EXISTS people (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,7 +110,6 @@ def init_db():
         last_interest_yyyymm TEXT,
         UNIQUE(user_id, canonical_name)
     )""")
-    # ledger
     cur.execute("""
     CREATE TABLE IF NOT EXISTS ledger (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,7 +121,6 @@ def init_db():
         note TEXT,
         due_ts INTEGER
     )""")
-    # actions for undo
     cur.execute("""
     CREATE TABLE IF NOT EXISTS actions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,7 +130,6 @@ def init_db():
         ref_table TEXT NOT NULL,
         ref_id INTEGER NOT NULL
     )""")
-    # settings (reminders)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS settings (
         user_id INTEGER PRIMARY KEY,
@@ -144,7 +140,6 @@ def init_db():
         last_daily_date TEXT,
         last_weekly_date TEXT
     )""")
-    # bot messages (for auto-cleanup)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS bot_msgs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,7 +172,7 @@ def parse_date_fuzzy(s: str) -> Optional[datetime]:
     s = (s or "").strip()
     if not s:
         return None
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d", "%d %b %Y", "%b %d %Y"):
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y", "%d/%m/%y", "%Y/%m/%d", "%d %b %Y", "%b %d %Y"):
         try:
             dt = datetime.strptime(s, fmt)
             return datetime(dt.year, dt.month, dt.day, tzinfo=TZ)
@@ -252,7 +247,7 @@ def find_person_id_exact(user_id: int, name: str) -> Optional[int]:
     return row["id"] if row else None
 
 def resolve_person_id(user_id: int, raw_name: str) -> Tuple[Optional[int], Optional[str]]:
-    """Best-effort resolution: exact → substring → fuzzy (difflib)."""
+    """Best-effort resolution: exact → substring → fuzzy."""
     if not raw_name:
         return None, None
     people = get_people(user_id)
@@ -539,7 +534,7 @@ def only_owner(message_or_query) -> bool:
 def deny_text() -> str:
     return "⛔️ This bot is private."
 
-# ---------- Safe send/edit wrappers (independent replies + logging) ----------
+# ---------- Safe send/edit wrappers ----------
 async def send_text(chat_id: int, text: str, kb=None):
     msg = await bot.send_message(chat_id, text, reply_markup=kb)
     record_bot_message(OWNER_ID, chat_id, msg.message_id)
@@ -630,7 +625,6 @@ def reset_confirm_kb():
     return kb.as_markup()
 
 def support_person_kb(pid: int):
-    # Action pad under Support AI
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Lend", callback_data=f"lend:{pid}")
     kb.button(text="💸 Repay", callback_data=f"repay:{pid}")
@@ -641,6 +635,18 @@ def support_person_kb(pid: int):
     kb.button(text="🗑 Delete", callback_data=f"person_delete_confirm:{pid}")
     kb.button(text="⬅️ Main", callback_data="back_main")
     kb.adjust(2,2,2,2)
+    return kb.as_markup()
+
+def import_summary_kb(has_issues: bool):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Apply Import", callback_data="import_apply")
+    if has_issues:
+        kb.button(text="❓ Why skipped?", callback_data="import_why")
+        kb.button(text="🛠 Review Skipped", callback_data="import_review")
+        kb.button(text="🧪 Aggressive Re-Parse", callback_data="import_guess_aggr")
+    kb.button(text="🗑 Discard", callback_data="import_discard")
+    kb.button(text="⬅️ Main", callback_data="back_main")
+    kb.adjust(2,2,2)
     return kb.as_markup()
 
 # ---------- States ----------
@@ -679,6 +685,8 @@ class WeeklyDowState(StatesGroup):
 
 class ImportState(StatesGroup):
     waiting_file = State()
+    reviewing = State()
+    fixing = State()
 
 class SupportAIState(StatesGroup):
     waiting_query = State()
@@ -692,7 +700,6 @@ async def start_cmd(m: Message):
         if BOT_PIN and m.from_user.id not in UNLOCKED:
             return await m.answer("🔒 Enter PIN to unlock:")
         init_db(); migrate_defaults()
-        # auto-delete old bot messages
         await delete_old_bot_messages(m.chat.id, keep_last=0)
         await send_text(
             m.chat.id,
@@ -803,7 +810,6 @@ async def skip_note_cb(c: CallbackQuery, state: FSMContext):
         if not only_owner(c): return await c.message.answer(deny_text())
         st = await state.get_state()
         data = await state.get_data()
-        # Expense → finalize immediately
         if st == AddExpenseStates.waiting_note.state:
             eid = add_expense(OWNER_ID, data["amount"], None, data.get("category"))
             log_action(OWNER_ID, "expense", "expenses", eid)
@@ -814,12 +820,10 @@ async def skip_note_cb(c: CallbackQuery, state: FSMContext):
                 f"🧮 This month: {CURRENCY}{total:,.2f}",
                 main_kb()
             )
-        # Lend → go to due date step
         elif st == LendStates.waiting_note.state:
             await state.update_data(note=None)
             await state.set_state(LendStates.waiting_due)
             await send_text(c.message.chat.id, "📅 Optional due date (YYYY-MM-DD) or type <code>skip</code>")
-        # Repay → finalize immediately
         elif st == RepayStates.waiting_note.state:
             lid = add_ledger(OWNER_ID, data["person_id"], "repay", data["amount"], None)
             log_action(OWNER_ID, "ledger", "ledger", lid)
@@ -903,13 +907,13 @@ async def cb_person_menu(c: CallbackQuery):
     except Exception as e:
         await c.message.answer(f"❌ person menu error: {e}")
 
-# Delete person with confirmation (fix)
+# Delete person with confirmation
 @router.callback_query(F.data.startswith("person_delete_confirm:"))
 async def person_delete_confirm(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
         pid = int(c.data.split(":")[1])
-        await send_text(c.message.chat.id, "⚠️ Delete this person and all related ledger?", 
+        await send_text(c.message.chat.id, "⚠️ Delete this person and all related ledger?",
                         InlineKeyboardBuilder()
                         .button(text="🗑 Yes, delete", callback_data=f"person_delete_do:{pid}")
                         .button(text="❌ Cancel", callback_data=f"person_menu:{pid}")
@@ -1331,7 +1335,184 @@ async def reset_all_do(c: CallbackQuery):
     except Exception as e:
         await c.message.answer(f"❌ reset error: {e}")
 
-# ---------- IMPORT SHEET (CSV/XLSX/PDF) ----------
+# ---------- IMPORT (staged) ----------
+STAGED_IMPORTS: Dict[int, Dict[str, Any]] = {}  # user_id -> {entries, issues, stats}
+
+def _colexists(cols, *names):
+    s = {c.strip().lower() for c in cols}
+    for n in names:
+        if n.lower() in s: return n.lower()
+    return None
+
+def _to_float_safe(v) -> Optional[float]:
+    try:
+        if v is None: return None
+        if isinstance(v, str): v = v.replace(",", "").replace("₹", "").strip()
+        f = float(v); return f
+    except Exception:
+        return None
+
+def _looks_total(line: str) -> bool:
+    s = line.strip().lower()
+    return s.startswith("total") or s.startswith("tl ") or s.startswith("tl as") or "all clear" in s
+
+def _parse_pdf_line(line: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse free text lines like:
+      Ramesh wale 1,500₹ 3/12/2024 UPI kaka pujari payment.
+      archna wale 100₹ 4/12/2024 UPI saban nirma , bazar
+      Ramesh wale 5,000₹
+      Ramesh wale 500₹ toli driver
+      Ramesh wale 4,280₹ 30-5-25 hapta bhrla
+    → default type='lend'
+    """
+    if not line or _looks_total(line):
+        return None
+    s = re.sub(r"\s+", " ", line).strip()
+    # name (2+ chars), amount, optional date, rest note
+    m = re.match(
+        r"^(?P<name>[A-Za-z][A-Za-z ._-]{1,})\s+(?P<amt>[\d,]+(?:\.\d+)?)\s*₹?\s*(?P<date>\d{1,2}[/-]\d{1,2}[/-]\d{2,4})?\s*(?P<note>.*)$",
+        s, re.IGNORECASE
+    )
+    if not m:
+        # Try: name … amount at end
+        m2 = re.match(r"^(?P<name>[A-Za-z][A-Za-z ._-]{1,}).*?(?P<amt>[\d,]+(?:\.\d+)?)\s*₹?\s*(?P<note>.*)$", s)
+        if not m2:
+            return None
+        name = m2.group("name").strip()
+        amt = _to_float_safe(m2.group("amt"))
+        note = m2.group("note").strip() or None
+        return {"kind":"ledger","name":name,"type":"lend","amount":amt,"note":note,"due_ts":None}
+    name = m.group("name").strip()
+    amt = _to_float_safe(m.group("amt"))
+    date = m.group("date")
+    note = (m.group("note") or "").strip() or None
+    due_ts = None
+    if date:
+        d = parse_date_fuzzy(date)
+        if d:
+            due_ts = int(d.replace(hour=23, minute=59).timestamp())
+    return {"kind":"ledger","name":name,"type":"lend","amount":amt,"note":note,"due_ts":due_ts}
+
+async def parse_file_to_entries(path: Path) -> Dict[str, Any]:
+    """
+    Returns dict:
+    {
+      "expenses": [ {amount, note, category} ],
+      "ledger":   [ {name, type, amount, note, due_ts} ],
+      "issues":   [ {"raw": "...", "reason": "..."} ],
+      "sheets":   int
+    }
+    """
+    results = {"expenses":[], "ledger":[], "issues":[], "sheets":0}
+    suf = path.suffix.lower()
+
+    def push_issue(raw, reason):
+        results["issues"].append({"raw": str(raw), "reason": reason})
+
+    try:
+        if suf == ".csv":
+            if not HAS_PANDAS: 
+                push_issue("CSV", "pandas not installed"); return results
+            df = pd.read_csv(path)
+            await _ingest_dataframe_to_staging(df, results); results["sheets"] = 1
+        elif suf in (".xlsx", ".xls"):
+            if not HAS_PANDAS:
+                push_issue("XLSX", "pandas/openpyxl not installed"); return results
+            x = pd.ExcelFile(path)
+            for s in x.sheet_names:
+                df = x.parse(s)
+                await _ingest_dataframe_to_staging(df, results)
+                results["sheets"] += 1
+        elif suf == ".pdf":
+            # First try tables
+            tab_rows = 0
+            if HAS_PDF:
+                with pdfplumber.open(path) as pdf:
+                    for page in pdf.pages:
+                        tables = page.extract_tables()
+                        for t in tables:
+                            if not t or len(t) < 2: 
+                                continue
+                            header = t[0]
+                            rows = t[1:]
+                            if HAS_PANDAS and len(rows) > 0 and len(header) >= 2:
+                                df = pd.DataFrame(rows, columns=header)
+                                await _ingest_dataframe_to_staging(df, results)
+                                results["sheets"] += 1
+                                tab_rows += len(rows)
+                    # Fallback to raw text if few rows parsed
+                    if tab_rows < 2:
+                        for page in pdf.pages:
+                            txt = page.extract_text() or ""
+                            for raw in [ln.strip() for ln in txt.splitlines() if ln.strip()]:
+                                if _looks_total(raw): 
+                                    continue
+                                ent = _parse_pdf_line(raw)
+                                if ent and ent.get("amount"):
+                                    results["ledger"].append(ent)
+                                else:
+                                    push_issue(raw, "Unrecognized PDF line")
+                        results["sheets"] = max(results["sheets"], 1)
+            else:
+                push_issue("PDF", "pdfplumber not installed")
+        else:
+            push_issue(path.name, "Unsupported file type")
+    except Exception as e:
+        push_issue(path.name, f"Parse error: {e}")
+    return results
+
+async def _ingest_dataframe_to_staging(df, results):
+    cols = [str(c).strip() for c in df.columns]
+    lower = [c.lower() for c in cols]
+    has_person = any(c in lower for c in ["person","name"])
+    has_amount = any(c in lower for c in ["amount","amt","value"])
+    has_type = any(c in lower for c in ["type","tx_type","kind"])
+    if not has_amount:
+        for _, row in df.iterrows():
+            results["issues"].append({"raw": str(list(row)), "reason":"No amount column"})
+        return
+
+    if not has_person:
+        c_amount = lower.index(_colexists(lower,"amount","amt","value"))
+        c_note = lower.index(_colexists(lower,"note","description","desc","remarks")) if _colexists(lower,"note","description","desc","remarks") else None
+        c_cat = lower.index(_colexists(lower,"category","cat","type")) if _colexists(lower,"category","cat","type") else None
+        for _, row in df.iterrows():
+            amt = _to_float_safe(row.iloc[c_amount])
+            if not amt:
+                results["issues"].append({"raw": str(list(row)), "reason":"Invalid amount"})
+                continue
+            note = (str(row.iloc[c_note]).strip() if (c_note is not None and (not HAS_PANDAS or pd.notna(row.iloc[c_note]))) else None)
+            cat = (str(row.iloc[c_cat]).strip() if (c_cat is not None and (not HAS_PANDAS or pd.notna(row.iloc[c_cat]))) else None)
+            results["expenses"].append({"amount":amt,"note":note,"category":cat})
+    else:
+        c_person = lower.index(_colexists(lower,"person","name"))
+        c_amount = lower.index(_colexists(lower,"amount","amt","value"))
+        c_type = lower.index(_colexists(lower,"type","tx_type","kind")) if has_type else None
+        c_note = lower.index(_colexists(lower,"note","description","desc","remarks")) if _colexists(lower,"note","description","desc","remarks") else None
+        c_due = lower.index(_colexists(lower,"duedate","due","deadline","due_date")) if _colexists(lower,"duedate","due","deadline","due_date") else None
+        for _, row in df.iterrows():
+            name = str(row.iloc[c_person]).strip()
+            amt = _to_float_safe(row.iloc[c_amount])
+            if not name or not amt:
+                results["issues"].append({"raw": str(list(row)), "reason":"Missing name or amount"})
+                continue
+            tx_type = None
+            if c_type is not None:
+                tx_type = str(row.iloc[c_type]).strip().lower()
+                if tx_type not in ("lend","repay"):
+                    tx_type = None
+            if tx_type is None:
+                tx_type = "lend" if amt > 0 else "repay"; amt = abs(amt)
+            note = (str(row.iloc[c_note]).strip() if (c_note is not None and (not HAS_PANDAS or pd.notna(row.iloc[c_note]))) else None)
+            due_ts = None
+            if c_due is not None:
+                dts = str(row.iloc[c_due]).strip()
+                if dts:
+                    d = parse_date_fuzzy(dts)
+                    if d: due_ts = int(d.replace(hour=23, minute=59).timestamp())
+            results["ledger"].append({"name":name,"type":tx_type,"amount":amt,"note":note,"due_ts":due_ts})
+
 @router.callback_query(F.data == "import_sheet")
 async def cb_import_sheet(c: CallbackQuery, state: FSMContext):
     try:
@@ -1339,7 +1520,7 @@ async def cb_import_sheet(c: CallbackQuery, state: FSMContext):
         await state.set_state(ImportState.waiting_file)
         await send_text(c.message.chat.id,
             "📥 <b>Import</b>\n"
-            "Upload CSV / XLSX / PDF (tables). From Google Sheets → Export CSV/XLSX.\n"
+            "Upload CSV / XLSX / PDF (tables or free text).\n"
             "Columns:\n"
             "• Expenses: date, amount, note, category\n"
             "• Ledger: person, type(lend|repay), amount, note, duedate\n"
@@ -1353,180 +1534,246 @@ async def _download_document(doc: Document, dest: Path):
     file = await bot.get_file(doc.file_id)
     await bot.download(file, destination=dest)
 
-def _colexists(cols, *names):
-    s = {c.strip().lower() for c in cols}
-    for n in names:
-        if n.lower() in s: return n.lower()
-    return None
-
-def _to_float_safe(v) -> Optional[float]:
-    try:
-        if v is None: return None
-        if isinstance(v, str): v = v.strip().replace(",", "")
-        f = float(v); return f
-    except Exception:
-        return None
-
-async def _ingest_dataframe(df, results):
-    cols = [str(c).strip() for c in df.columns]
-    lower = [c.lower() for c in cols]
-    has_person = any(c in lower for c in ["person","name"])
-    has_amount = any(c in lower for c in ["amount","amt","value"])
-    has_type = any(c in lower for c in ["type","tx_type","kind"])
-    if not has_amount:
-        results["skipped"] += len(df); return
-
-    if not has_person:
-        c_amount = lower.index(_colexists(lower,"amount","amt","value"))
-        c_note = lower.index(_colexists(lower,"note","description","desc","remarks")) if _colexists(lower,"note","description","desc","remarks") else None
-        c_cat = lower.index(_colexists(lower,"category","cat","type")) if _colexists(lower,"category","cat","type") else None
-        for _, row in df.iterrows():
-            amt = _to_float_safe(row.iloc[c_amount]); 
-            if (amt is None) or (amt == 0): 
-                results["skipped"] += 1; continue
-            note = (str(row.iloc[c_note]).strip() if (c_note is not None and (not HAS_PANDAS or pd.notna(row.iloc[c_note]))) else None)
-            cat = (str(row.iloc[c_cat]).strip() if (c_cat is not None and (not HAS_PANDAS or pd.notna(row.iloc[c_cat]))) else None)
-            eid = add_expense(OWNER_ID, amt, note, cat)
-            log_action(OWNER_ID, "expense", "expenses", eid)
-            results["expenses"] += 1
-    else:
-        c_person = lower.index(_colexists(lower,"person","name"))
-        c_amount = lower.index(_colexists(lower,"amount","amt","value"))
-        c_type = lower.index(_colexists(lower,"type","tx_type","kind")) if has_type else None
-        c_note = lower.index(_colexists(lower,"note","description","desc","remarks")) if _colexists(lower,"note","description","desc","remarks") else None
-        c_due = lower.index(_colexists(lower,"duedate","due","deadline","due_date")) if _colexists(lower,"duedate","due","deadline","due_date") else None
-        for _, row in df.iterrows():
-            name = str(row.iloc[c_person]).strip()
-            if not name:
-                results["skipped"] += 1; continue
-            pid, _disp = resolve_person_id(OWNER_ID, name)
-            if not pid:
-                pid, _ = add_person(OWNER_ID, name)
-            amt = _to_float_safe(row.iloc[c_amount])
-            if (amt is None) or (amt == 0):
-                results["skipped"] += 1; continue
-            tx_type = None
-            if c_type is not None:
-                tx_type = str(row.iloc[c_type]).strip().lower()
-                if tx_type not in ("lend","repay"):
-                    tx_type = None
-            if tx_type is None:
-                tx_type = "lend" if amt > 0 else "repay"
-                amt = abs(amt)
-            note = (str(row.iloc[c_note]).strip() if (c_note is not None and (not HAS_PANDAS or pd.notna(row.iloc[c_note]))) else None)
-            due_ts = None
-            if c_due is not None:
-                dts = str(row.iloc[c_due]).strip()
-                if dts:
-                    d = parse_date_fuzzy(dts)
-                    if d: due_ts = int(d.replace(hour=23, minute=59).timestamp())
-            lid = add_ledger(OWNER_ID, pid, tx_type, amt, note, due_ts)
-            log_action(OWNER_ID, "ledger", "ledger", lid)
-            results["ledger"] += 1
-
 @router.message(ImportState.waiting_file, F.document)
 async def handle_import_file(m: Message, state: FSMContext):
     try:
         if not only_owner(m): return await m.answer(deny_text())
         doc = m.document
-        suffix = (doc.file_name or "").lower()
         tmp_dir = Path("imports"); tmp_dir.mkdir(exist_ok=True)
         dest = tmp_dir / f"{int(time.time())}_{doc.file_name}"
         await _download_document(doc, dest)
 
-        results = {"expenses":0, "ledger":0, "skipped":0, "sheets":0}
-        try:
-            if suffix.endswith(".csv"):
-                if not HAS_PANDAS:
-                    return await m.answer("⚠️ Install pandas to import CSV/XLSX.")
-                df = pd.read_csv(dest)
-                await _ingest_dataframe(df, results); results["sheets"] = 1
-            elif suffix.endswith(".xlsx") or suffix.endswith(".xls"):
-                if not HAS_PANDAS:
-                    return await m.answer("⚠️ Install pandas/openpyxl to import XLSX.")
-                x = pd.ExcelFile(dest)
-                for s in x.sheet_names:
-                    df = x.parse(s)
-                    await _ingest_dataframe(df, results)
-                    results["sheets"] += 1
-            elif suffix.endswith(".pdf"):
-                if not (HAS_PANDAS and HAS_PDF):
-                    return await m.answer("⚠️ Install pandas + pdfplumber to import PDF tables.")
-                with pdfplumber.open(dest) as pdf:
-                    for page in pdf.pages:
-                        tables = page.extract_tables()
-                        for t in tables:
-                            if not t or len(t) < 2: 
-                                continue
-                            header = t[0]
-                            rows = t[1:]
-                            df = pd.DataFrame(rows, columns=header)
-                            await _ingest_dataframe(df, results)
-                            results["sheets"] += 1
-            else:
-                return await m.answer("⚠️ Upload CSV / XLSX / PDF.")
-        except Exception as e:
-            return await m.answer(f"❌ Import failed: {e}")
-
-        await state.clear()
+        parsed = await parse_file_to_entries(dest)
+        # Stage and show summary
+        STAGED_IMPORTS[OWNER_ID] = {"file": str(dest), **parsed, "pos":0}
+        exp_n = len(parsed["expenses"])
+        led_n = len(parsed["ledger"])
+        iss_n = len(parsed["issues"])
         month = cur_yyyymm()
-        total = monthly_total(OWNER_ID, month)
+        await state.set_state(ImportState.reviewing)
         await send_text(m.chat.id,
-            f"✅ <b>Import complete</b>\n"
-            f"Sheets: {results['sheets']}\n"
-            f"Expenses added: {results['expenses']}\n"
-            f"Ledger rows added: {results['ledger']}\n"
-            f"Skipped rows: {results['skipped']}\n\n"
-            f"🧾 {month} spend: <b>{CURRENCY}{total:,.2f}</b>",
-            main_kb()
+            f"🔎 <b>Import analysis (staged)</b>\n"
+            f"Sheets: {parsed['sheets']}\n"
+            f"Expenses detected: {exp_n}\n"
+            f"Ledger rows detected: {led_n}\n"
+            f"Skipped / issues: {iss_n}\n\n"
+            f"Nothing has been written yet. Review or Apply.",
+            import_summary_kb(iss_n>0)
         )
     except Exception as e:
         await m.answer(f"❌ import handler error: {e}")
 
-# ---------- SUPPORT (AI) — “Support” that can manage everything ----------
-@router.callback_query(F.data == "support_ai")
-async def cb_support_ai(c: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data == "import_why")
+async def import_why(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
-        await state.set_state(SupportAIState.waiting_query)
+        st = STAGED_IMPORTS.get(OWNER_ID)
+        if not st: return await send_text(c.message.chat.id, "No staged import.", main_kb())
+        reasons = {}
+        for it in st["issues"]:
+            reasons[it["reason"]] = reasons.get(it["reason"], 0) + 1
+        lines = ["❓ <b>Why rows were skipped</b>"]
+        for r, n in reasons.items():
+            lines.append(f"• {r}: {n}")
+        lines.append("\nTip: Use <b>🛠 Review Skipped</b> or <b>🧪 Aggressive Re-Parse</b>.")
+        await send_text(c.message.chat.id, "\n".join(lines), import_summary_kb(True)); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ why error: {e}")
+
+@router.callback_query(F.data == "import_guess_aggr")
+async def import_guess_aggr(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        st = STAGED_IMPORTS.get(OWNER_ID)
+        if not st: return await send_text(c.message.chat.id, "No staged import.", main_kb())
+        # Aggressive: try to parse any issue line with fallback regex again
+        new_ledger = list(st["ledger"])
+        remaining = []
+        for it in st["issues"]:
+            ent = _parse_pdf_line(it["raw"])
+            if ent and ent.get("amount"):
+                new_ledger.append(ent)
+            else:
+                remaining.append(it)
+        st["ledger"] = new_ledger
+        st["issues"] = remaining
+        STAGED_IMPORTS[OWNER_ID] = st
         await send_text(c.message.chat.id,
-            "🧑‍🤝‍🧑 <b>Support</b>\n"
-            "Ask me anything about your data: ‘who is Raj’, ‘what’s with Raj’, ‘how much do I owe Ajay’, "
-            "‘lend 500 to Raj’, ‘ledger Ajay’, ‘delete Raj’, ‘monthly spend’, ‘due soon’, etc.")
+            f"🧪 Aggressive parse added {len(new_ledger)-len(st['ledger']) if False else 0} rows.\n"
+            f"Ledger now: {len(st['ledger'])}\n"
+            f"Issues left: {len(st['issues'])}",
+            import_summary_kb(len(st["issues"])>0))
         await c.answer()
     except Exception as e:
-        await c.message.answer(f"❌ support ui error: {e}")
+        await c.message.answer(f"❌ aggressive parse error: {e}")
 
+@router.callback_query(F.data == "import_review")
+async def import_review(c: CallbackQuery, state: FSMContext):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        st = STAGED_IMPORTS.get(OWNER_ID)
+        if not st or not st["issues"]:
+            return await send_text(c.message.chat.id, "🎉 Nothing to review. You can Apply.", import_summary_kb(False))
+        pos = st.get("pos", 0) % len(st["issues"])
+        item = st["issues"][pos]
+        kb = InlineKeyboardBuilder()
+        kb.button(text="➕ Save as Lend", callback_data=f"imp_fix:{pos}:lend")
+        kb.button(text="➖ Save as Repay", callback_data=f"imp_fix:{pos}:repay")
+        kb.button(text="➡️ Skip this", callback_data=f"imp_skip:{pos}")
+        kb.button(text="⏭ Next", callback_data="import_review_next")
+        kb.button(text="⬅️ Back", callback_data="back_main")
+        kb.adjust(2,2,1)
+        await state.set_state(ImportState.reviewing)
+        await send_text(c.message.chat.id,
+            f"🛠 <b>Review {pos+1}/{len(st['issues'])}</b>\n"
+            f"<code>{item['raw']}</code>\n"
+            f"Reason: {item['reason']}\n\n"
+            "Pick an action. I’ll try to auto-extract name/amount.",
+            kb.as_markup()
+        )
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ review error: {e}")
+
+@router.callback_query(F.data == "import_review_next")
+async def import_review_next(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        st = STAGED_IMPORTS.get(OWNER_ID)
+        if not st or not st["issues"]:
+            return await send_text(c.message.chat.id, "🎉 Nothing to review. You can Apply.", import_summary_kb(False))
+        st["pos"] = (st.get("pos", 0) + 1) % len(st["issues"])
+        STAGED_IMPORTS[OWNER_ID] = st
+        await import_review(c, FSMContext)  # reuse
+    except Exception as e:
+        await c.message.answer(f"❌ next error: {e}")
+
+@router.callback_query(F.data.startswith("imp_skip:"))
+async def import_skip_one(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        st = STAGED_IMPORTS.get(OWNER_ID); 
+        if not st: return await send_text(c.message.chat.id, "No staged import.", main_kb())
+        pos = int(c.data.split(":")[1])
+        if 0 <= pos < len(st["issues"]):
+            st["issues"].pop(pos)
+            st["pos"] = 0
+        STAGED_IMPORTS[OWNER_ID] = st
+        await send_text(c.message.chat.id, f"⏭ Skipped. Issues left: {len(st['issues'])}", import_summary_kb(len(st["issues"])>0))
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ skip-one error: {e}")
+
+@router.callback_query(F.data.startswith("imp_fix:"))
+async def import_fix_one(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        _, pos_s, kind = c.data.split(":")
+        pos = int(pos_s)
+        st = STAGED_IMPORTS.get(OWNER_ID)
+        if not st or not (0 <= pos < len(st["issues"])):
+            return await send_text(c.message.chat.id, "No such issue.", import_summary_kb(bool(st and st["issues"])))
+        raw = st["issues"][pos]["raw"]
+        ent = _parse_pdf_line(raw) or {}
+        name = ent.get("name")
+        amt = ent.get("amount")
+        if not name or not amt:
+            return await send_text(c.message.chat.id, "⚠️ Couldn’t auto-extract. Please type like: <code>lend 500 to Ramesh note: phone</code>", import_summary_kb(True))
+        ent["type"] = "lend" if kind=="lend" else "repay"
+        st["ledger"].append(ent)
+        st["issues"].pop(pos)
+        st["pos"] = 0
+        STAGED_IMPORTS[OWNER_ID] = st
+        await send_text(c.message.chat.id, f"✅ Saved {kind} for {name} ({CURRENCY}{amt:,.2f}). Issues left: {len(st['issues'])}", import_summary_kb(len(st["issues"])>0))
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ fix-one error: {e}")
+
+@router.callback_query(F.data == "import_discard")
+async def import_discard(c: CallbackQuery, state: FSMContext):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        STAGED_IMPORTS.pop(OWNER_ID, None)
+        await state.clear()
+        await send_text(c.message.chat.id, "🗑 Discarded staged import.", main_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ discard error: {e}")
+
+@router.callback_query(F.data == "import_apply")
+async def import_apply(c: CallbackQuery, state: FSMContext):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        st = STAGED_IMPORTS.get(OWNER_ID)
+        if not st:
+            return await send_text(c.message.chat.id, "No staged import.", main_kb())
+        # Apply
+        added_exp = 0; added_led = 0
+        # Expenses
+        for e in st["expenses"]:
+            eid = add_expense(OWNER_ID, e["amount"], e.get("note"), e.get("category"))
+            log_action(OWNER_ID, "expense", "expenses", eid)
+            added_exp += 1
+        # Ledger
+        for l in st["ledger"]:
+            name = l["name"]
+            pid, _disp = resolve_person_id(OWNER_ID, name)
+            if not pid:
+                pid, _ = add_person(OWNER_ID, name)
+            lid = add_ledger(OWNER_ID, pid, l["type"], l["amount"], l.get("note"), l.get("due_ts"))
+            log_action(OWNER_ID, "ledger", "ledger", lid)
+            added_led += 1
+        issues_n = len(st["issues"])
+        STAGED_IMPORTS.pop(OWNER_ID, None)
+        await state.clear()
+        month = cur_yyyymm()
+        total = monthly_total(OWNER_ID, month)
+        await send_text(c.message.chat.id,
+            f"✅ <b>Import complete</b>\n"
+            f"Expenses added: {added_exp}\n"
+            f"Ledger rows added: {added_led}\n"
+            f"Skipped: {issues_n}\n\n"
+            f"🧾 {month} spend: <b>{CURRENCY}{total:,.2f}</b>",
+            main_kb()
+        )
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ apply error: {e}")
+
+# ---------- SUPPORT (AI) ----------
 def _nl_intent(q: str):
     s = canonical(q)
 
-    # high-level
     if "monthly" in s and ("spend" in s or "expense" in s):
         return ("monthly_spend", None)
     if "due" in s or "overdue" in s or "due soon" in s:
         return ("due_soon", None)
+    if "who owes me most" in s or "top balances" in s:
+        return ("top_balances", None)
 
-    # who/what is X, what's with X
     m = re.search(r"(?:who is|what is|whats|what'?s|what about|whats with|what with)\s+([a-z0-9 ._-]{2,})", s)
     if m:
         return ("person_summary", m.group(1).strip())
 
-    # balance / owe
     m = re.search(r"(?:balance(?: with| of| for)?|how much .* owe(?: to)?|i owe|owe(?: to)?)\s+([a-z0-9 ._-]{2,})", s)
     if m:
         return ("balance_person", m.group(1).strip())
 
-    # operations: delete / remove
     m = re.search(r"(?:delete|remove)\s+([a-z0-9 ._-]{2,})", s)
     if m:
         return ("delete_person", m.group(1).strip())
 
-    # ledger request
     m = re.search(r"(?:ledger|history|statement)\s+(?:of|for)?\s*([a-z0-9 ._-]{2,})", s)
     if m:
         return ("ledger_person", m.group(1).strip())
 
-    # lend/repay forms
+    m = re.search(r"(?:set|update)\s+limit\s+(?:for\s+)?([a-z0-9 ._-]{2,})\s+(?:to\s+)?(\d+(?:\.\d{1,2})?)", s)
+    if m:
+        return ("set_limit", (m.group(1).strip(), float(m.group(2))))
+
+    m = re.search(r"(?:interest|rate)\s+(?:for\s+)?([a-z0-9 ._-]{2,})\s+(?:is\s+|=)?\s*(\d+(?:\.\d{1,2})?)\s*%?", s)
+    if m:
+        return ("set_interest", (m.group(1).strip(), float(m.group(2))))
+
     m = re.search(r"(?:lend|give)\s+(\d+(?:\.\d{1,2})?)\s+(?:to\s+)?([a-z0-9 ._-]{2,})", s)
     if m:
         return ("lend_to", (float(m.group(1)), m.group(2).strip()))
@@ -1534,7 +1781,6 @@ def _nl_intent(q: str):
     if m:
         return ("repay_from", (float(m.group(1)), m.group(2).strip()))
 
-    # bare name → suggest actions
     names = [p["display_name"].lower() for p in get_people(OWNER_ID)]
     for nm in names:
         if nm in s.split():
@@ -1555,6 +1801,20 @@ async def ai_explain(prompt: str, base_reply: str, context: str) -> Optional[str
         return None
     except Exception:
         return None
+
+@router.callback_query(F.data == "support_ai")
+async def cb_support_ai(c: CallbackQuery, state: FSMContext):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await state.set_state(SupportAIState.waiting_query)
+        await send_text(c.message.chat.id,
+            "🧑‍🤝‍🧑 <b>Support</b>\n"
+            "Ask me anything about your data: ‘who is Raj’, ‘what’s with Raj’, ‘how much do I owe Ajay’, "
+            "‘lend 500 to Raj’, ‘ledger Ajay’, ‘delete Raj’, ‘monthly spend’, ‘due soon’, etc.\n\n"
+            "I will answer independently and execute actions when you ask.")
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ support ui error: {e}")
 
 @router.message(SupportAIState.waiting_query)
 async def handle_support_query(m: Message, state: FSMContext):
@@ -1584,6 +1844,18 @@ async def handle_support_query(m: Message, state: FSMContext):
             extra = await ai_explain(q, base, "Due soon list above.")
             await state.clear()
             return await send_text(m.chat.id, extra or base, main_kb())
+
+        if intent == "top_balances":
+            tb = top_balances(OWNER_ID, 10)
+            if not tb:
+                base = "No outstanding balances."
+            else:
+                lines = ["👑 <b>Top balances</b>"]
+                for r in tb:
+                    lines.append(f"• {r['display_name']}: {CURRENCY}{float(r['balance']):,.2f}")
+                base = "\n".join(lines)
+            await state.clear()
+            return await send_text(m.chat.id, base, main_kb())
 
         if intent in ("person_summary","balance_person","ledger_person","delete_person"):
             name = arg
@@ -1619,7 +1891,6 @@ async def handle_support_query(m: Message, state: FSMContext):
                 await state.clear()
                 return await send_text(m.chat.id, base, support_person_kb(pid))
 
-            # person_summary / balance_person
             bal = person_balance(OWNER_ID, pid)
             rate, _ = get_person_interest_info(OWNER_ID, pid)
             lim = get_credit_limit(OWNER_ID, pid)
@@ -1657,7 +1928,6 @@ async def handle_support_query(m: Message, state: FSMContext):
                 f"✅ {'Lend' if intent=='lend_to' else 'Repay'} {CURRENCY}{amt:,.2f} {'to' if intent=='lend_to' else 'from'} <b>{disp}</b>\n"
                 f"💼 Balance: {CURRENCY}{bal:,.2f}", support_person_kb(pid))
 
-        # unknown → nudge + AI assist
         base = "🤖 I can: ‘who is Raj’, ‘what’s with Raj’, ‘Ajay balance’, ‘lend 500 to Raj’, ‘delete Ajay’, ‘monthly spend’, ‘due soon’, ‘ledger Raj’."
         extra = await ai_explain(q, base, "Help user with supported intents.")
         await state.clear()
@@ -1793,13 +2063,11 @@ async def scheduler_loop():
             await apply_monthly_interest()
             s = get_settings(OWNER_ID)
             now = datetime.now(TZ)
-            # Daily
             if s["daily_reminders"]:
                 today = now.strftime("%Y-%m-%d")
                 if s["last_daily_date"] != today and now.hour >= int(s["daily_hour"]):
                     await send_daily_summary()
                     set_setting(OWNER_ID, "last_daily_date", today)
-            # Weekly
             if s["weekly_reminders"]:
                 week_key = f"{now.year}-W{now.isocalendar().week}"
                 if now.weekday() == int(s["weekly_dow"]) and now.hour >= 10 and s["last_weekly_date"] != week_key:
