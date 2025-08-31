@@ -388,23 +388,53 @@ def record_bot_message(user_id: int, chat_id: int, msg_id: int):
     con = db(); cur = con.cursor()
     cur.execute("INSERT INTO bot_msgs (user_id, chat_id, msg_id, ts) VALUES (?,?,?,?)",
                 (user_id, chat_id, msg_id, now_ts()))
+    # keep history reasonable per user (only records for cleanup)
     cur.execute("DELETE FROM bot_msgs WHERE id NOT IN (SELECT id FROM bot_msgs WHERE user_id=? ORDER BY id DESC LIMIT 200)", (user_id,))
     con.commit(); con.close()
 
 async def delete_old_bot_messages(chat_id: int, keep_last: int=0):
+    """
+    Deletes older bot messages in this chat, keeping the newest `keep_last`.
+    (Fix) We no longer purge kept rows from DB so cleanup keeps working reliably.
+    """
     con = db(); cur = con.cursor()
     cur.execute("SELECT id, msg_id FROM bot_msgs WHERE user_id=? AND chat_id=? ORDER BY id DESC", (OWNER_ID, chat_id))
-    rows = cur.fetchall(); con.close()
+    rows = cur.fetchall()
+    con.close()
+
+    kept_ids: List[int] = []
     for i, r in enumerate(rows):
-        if i < keep_last:  # keep newest N
+        if i < keep_last:
+            kept_ids.append(r["id"])
             continue
         try:
             await bot.delete_message(chat_id, r["msg_id"])
         except Exception:
             pass
+
     con = db(); cur = con.cursor()
-    cur.execute("DELETE FROM bot_msgs WHERE user_id=? AND chat_id=?", (OWNER_ID, chat_id))
+    if kept_ids:
+        placeholders = ",".join(["?"] * len(kept_ids))
+        cur.execute(
+            f"DELETE FROM bot_msgs WHERE user_id=? AND chat_id=? AND id NOT IN ({placeholders})",
+            (OWNER_ID, chat_id, *kept_ids)
+        )
+    else:
+        cur.execute("DELETE FROM bot_msgs WHERE user_id=? AND chat_id=?", (OWNER_ID, chat_id))
     con.commit(); con.close()
+
+# NEW: instant wipe helper (hard wipe on flow entry)
+async def wipe_ui(chat_id: int, source_message: Optional[Message]=None, keep_last:int=0):
+    """
+    Deletes the tapped message (old menu) immediately and wipes previous bot UI.
+    Note: Telegram can only delete bot's own messages (not user's).
+    """
+    if source_message:
+        try:
+            await bot.delete_message(chat_id, source_message.message_id)
+        except Exception:
+            pass
+    await delete_old_bot_messages(chat_id, keep_last=keep_last)
 
 # ---------- Exports ----------
 def export_person_csv(user_id: int, person_id: int, display_name: str) -> Path:
@@ -697,6 +727,7 @@ async def pin_try(m: Message):
 async def back_main(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         await send_text(c.message.chat.id, "🏠 <b>Main Menu</b>", main_kb()); await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ back error: {e}")
@@ -706,6 +737,7 @@ async def back_main(c: CallbackQuery):
 async def help_quick(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         txt = ("ℹ️ <b>Quick Add Help</b>\n"
                "• <code>Ajay +500 cab</code>\n"
                "• <code>Ajay -300 dinner</code>\n"
@@ -724,6 +756,7 @@ EXP_CATS = ["Food","Travel","Bills","Other","✍️ Custom"]
 async def cb_add_expense(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)  # hard wipe on flow entry
         await state.set_state(AddExpenseStates.waiting_amount)
         await send_text(c.message.chat.id, "➕ Enter expense amount (number):")
         await c.answer()
@@ -743,7 +776,7 @@ async def get_exp_amount(m: Message, state: FSMContext):
         for cat in EXP_CATS: kb.button(text=cat, callback_data=f"exp_cat:{cat}")
         kb.adjust(2,2,1)
         await state.set_state(AddExpenseStates.waiting_category)
-        await m.answer("🏷️ Pick a category:", reply_markup=kb.as_markup())
+        await send_text(m.chat.id, "🏷️ Pick a category:", kb.as_markup())
     except Exception as e:
         await m.answer(f"❌ exp amount error: {e}")
 
@@ -751,6 +784,7 @@ async def get_exp_amount(m: Message, state: FSMContext):
 async def pick_cat(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         cat = c.data.split(":")[1]
         if cat == "✍️ Custom":
             await state.set_state(AddExpenseStates.waiting_custom_cat)
@@ -778,6 +812,7 @@ async def exp_custom_cat(m: Message, state: FSMContext):
 async def skip_note_cb(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         st = await state.get_state()
         data = await state.get_data()
         if st == AddExpenseStates.waiting_note.state:
@@ -830,6 +865,7 @@ async def get_exp_note(m: Message, state: FSMContext):
 async def cb_people(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         await send_text(c.message.chat.id, "👥 <b>People</b>\n(+ means they owe you)", people_kb(OWNER_ID)); await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ people error: {e}")
@@ -838,6 +874,7 @@ async def cb_people(c: CallbackQuery):
 async def cb_person_add(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         await state.set_state(AddPersonStates.waiting_name)
         await send_text(c.message.chat.id, "👤 Send the person’s name to add:")
         await c.answer()
@@ -859,6 +896,7 @@ async def person_add_name(m: Message, state: FSMContext):
 async def cb_person_menu(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         pid = int(c.data.split(":")[1])
         con = db(); cur = con.cursor()
         cur.execute("SELECT display_name, credit_limit, monthly_interest_rate FROM people WHERE user_id=? AND id=?",
@@ -882,6 +920,7 @@ async def cb_person_menu(c: CallbackQuery):
 async def person_delete_confirm(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         pid = int(c.data.split(":")[1])
         kb = InlineKeyboardBuilder()
         kb.button(text="🗑 Yes, delete", callback_data=f"person_delete_do:{pid}")
@@ -895,6 +934,7 @@ async def person_delete_confirm(c: CallbackQuery):
 async def person_delete_do(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         pid = int(c.data.split(":")[1])
         delete_person(OWNER_ID, pid)
         await send_text(c.message.chat.id, "🗑 Deleted. Back to people list.", people_kb(OWNER_ID)); await c.answer()
@@ -906,6 +946,7 @@ async def person_delete_do(c: CallbackQuery):
 async def cb_lend(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         pid = int(c.data.split(":")[1])
         await state.set_state(LendStates.waiting_amount); await state.update_data(person_id=pid)
         await send_text(c.message.chat.id, "➕ Enter LEND amount (they owe you):")
@@ -966,6 +1007,7 @@ async def lend_due(m: Message, state: FSMContext):
 async def cb_repay(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         pid = int(c.data.split(":")[1])
         await state.set_state(RepayStates.waiting_amount); await state.update_data(person_id=pid)
         await send_text(c.message.chat.id, "💸 Enter REPAY amount (they returned to you):")
@@ -1009,10 +1051,12 @@ async def repay_note(m: Message, state: FSMContext):
 async def cb_settle(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         pid = int(c.data.split(":")[1])
         bal = person_balance(OWNER_ID, pid)
         if abs(bal) < 1e-9:
-            await c.answer("Already settled"); return
+            await send_text(c.message.chat.id, "Already settled", people_kb(OWNER_ID))
+            await c.answer(); return
         if bal > 0:
             lid = add_ledger(OWNER_ID, pid, "repay", bal, "auto-settle")
         else:
@@ -1029,6 +1073,7 @@ async def cb_settle(c: CallbackQuery):
 async def cb_setlimit(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         pid = int(c.data.split(":")[1])
         await state.set_state(LimitState.waiting_amount); await state.update_data(person_id=pid)
         await send_text(c.message.chat.id, "🎯 Send limit amount (number) or <code>0</code> to clear.")
@@ -1055,6 +1100,7 @@ async def setlimit_amount(m: Message, state: FSMContext):
 async def cb_setinterest(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         pid = int(c.data.split(":")[1])
         await state.set_state(InterestState.waiting_rate); await state.update_data(person_id=pid)
         await send_text(c.message.chat.id, "💠 Send monthly interest rate in % (e.g., 2). Use 0 to clear.")
@@ -1082,6 +1128,7 @@ async def setinterest_rate(m: Message, state: FSMContext):
 async def cb_ledger(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         pid = int(c.data.split(":")[1])
         con = db(); cur = con.cursor()
         cur.execute("SELECT display_name FROM people WHERE user_id=? AND id=?", (OWNER_ID, pid))
@@ -1111,6 +1158,7 @@ async def cb_ledger(c: CallbackQuery):
 async def cb_export_person(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         pid = int(c.data.split(":")[1])
         con = db(); cur = con.cursor()
         cur.execute("SELECT display_name FROM people WHERE user_id=? AND id=?", (OWNER_ID, pid))
@@ -1127,6 +1175,7 @@ async def cb_export_person(c: CallbackQuery):
 async def cb_export_all(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         zpath = export_all_zip(OWNER_ID)
         await send_document(c.message.chat.id, zpath, caption="📦 All ledgers + expenses")
         await c.answer("Exported")
@@ -1138,6 +1187,7 @@ async def cb_export_all(c: CallbackQuery):
 async def cb_monthly(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         month = cur_yyyymm(); total = monthly_total(OWNER_ID, month)
         tb = top_balances(OWNER_ID, 5)
         lines = [f"📊 <b>{month} Summary</b>", f"🧾 Personal Spend: <b>{CURRENCY}{total:,.2f}</b>"]
@@ -1158,6 +1208,7 @@ async def cb_monthly(c: CallbackQuery):
 async def cb_cat_chart(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         png = render_category_chart_png(OWNER_ID, cur_yyyymm())
         if not png:
             return await send_text(c.message.chat.id, "ℹ️ No data or chart engine unavailable.", main_kb())
@@ -1171,6 +1222,7 @@ async def cb_cat_chart(c: CallbackQuery):
 async def cb_due_soon(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         rows = due_items(OWNER_ID, 7)
         if not rows:
             txt = "✅ Nothing due in the next 7 days."
@@ -1189,6 +1241,7 @@ async def cb_due_soon(c: CallbackQuery):
 async def cb_reminders(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         s = get_settings(OWNER_ID)
         days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
         text = (f"🔔 <b>Reminders</b>\n"
@@ -1222,6 +1275,7 @@ async def toggle_weekly(c: CallbackQuery):
 async def ask_daily_hour(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         await state.set_state(DailyHourState.waiting_hour)
         await send_text(c.message.chat.id, "🕘 Send daily reminder hour (0-23 IST):")
         await c.answer()
@@ -1245,6 +1299,7 @@ async def set_daily_hour(m: Message, state: FSMContext):
 async def ask_weekly_dow(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         await state.set_state(WeeklyDowState.waiting_dow)
         await send_text(c.message.chat.id, "📅 Send weekly day number (0=Mon .. 6=Sun):")
         await c.answer()
@@ -1269,6 +1324,7 @@ async def set_weekly_dow(m: Message, state: FSMContext):
 async def cb_undo(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         msg = undo_last(OWNER_ID)
         await send_text(c.message.chat.id, f"🧹 {msg}", main_kb()); await c.answer("Done")
     except Exception as e:
@@ -1278,6 +1334,7 @@ async def cb_undo(c: CallbackQuery):
 async def reset_all_confirm(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         await send_text(c.message.chat.id,
             "⚠️ <b>Reset Everything?</b>\nThis will delete ALL people, ledger, expenses and settings. This cannot be undone.",
             reset_confirm_kb())
@@ -1289,6 +1346,7 @@ async def reset_all_confirm(c: CallbackQuery):
 async def reset_all_do(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         con = db(); cur = con.cursor()
         for tbl in ("ledger","expenses","people","actions","settings"):
             cur.execute(f"DELETE FROM {tbl} WHERE user_id=?", (OWNER_ID,))
@@ -1447,6 +1505,7 @@ async def parse_file_to_entries(path: Path) -> Dict[str, Any]:
 async def cb_import_sheet(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         await state.set_state(ImportState.waiting_file)
         await send_text(c.message.chat.id,
             "📥 <b>Import</b>\n"
@@ -1492,6 +1551,7 @@ async def handle_import_file(m: Message, state: FSMContext):
 async def import_why(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         st = STAGED_IMPORTS.get(OWNER_ID)
         if not st: return await send_text(c.message.chat.id, "No staged import.", main_kb())
         reasons = {}
@@ -1509,6 +1569,7 @@ async def import_why(c: CallbackQuery):
 async def import_guess_aggr(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         st = STAGED_IMPORTS.get(OWNER_ID)
         if not st: return await send_text(c.message.chat.id, "No staged import.", main_kb())
         improved = 0
@@ -1534,6 +1595,7 @@ async def import_guess_aggr(c: CallbackQuery):
 async def import_review(c: CallbackQuery):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         st = STAGED_IMPORTS.get(OWNER_ID)
         if not st or not st["issues"]:
             return await send_text(c.message.chat.id, "🎉 Nothing to review. You can Apply.", import_summary_kb(False))
@@ -1580,6 +1642,7 @@ async def import_skip_one(c: CallbackQuery):
         if 0 <= pos < len(st["issues"]):
             st["issues"].pop(pos); st["pos"] = 0
         STAGED_IMPORTS[OWNER_ID] = st
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         await send_text(c.message.chat.id, f"⏭ Skipped. Issues left: {len(st['issues'])}", import_summary_kb(len(st["issues"])>0))
         await c.answer()
     except Exception as e:
@@ -1597,6 +1660,7 @@ async def import_fix_one(c: CallbackQuery):
         raw = st["issues"][pos]["raw"]
         ent = _parse_pdf_line(raw) or {}
         name = ent.get("name"); amt = ent.get("amount")
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         if not name or not amt:
             return await send_text(c.message.chat.id, "⚠️ Couldn’t auto-extract. Type like: <code>lend 500 to Ramesh note: phone</code>", import_summary_kb(True))
         ent["type"] = "lend" if kind=="lend" else "repay"
@@ -1611,6 +1675,7 @@ async def import_fix_one(c: CallbackQuery):
 async def import_discard(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         STAGED_IMPORTS.pop(OWNER_ID, None); await state.clear()
         await send_text(c.message.chat.id, "🗑 Discarded staged import.", main_kb()); await c.answer()
     except Exception as e:
@@ -1620,6 +1685,7 @@ async def import_discard(c: CallbackQuery, state: FSMContext):
 async def import_apply(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         st = STAGED_IMPORTS.get(OWNER_ID)
         if not st: return await send_text(c.message.chat.id, "No staged import.", main_kb())
         added_exp = 0; added_led = 0
@@ -1736,6 +1802,7 @@ async def ai_explain(prompt: str, base_reply: str, context: str) -> Optional[str
 async def cb_support_ai(c: CallbackQuery, state: FSMContext):
     try:
         if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         await state.set_state(SupportAIState.waiting_query)
         # Independent, no main menu attached
         await send_text(
