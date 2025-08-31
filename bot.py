@@ -8,8 +8,7 @@ import time
 import json
 import zipfile
 import difflib
-import asyncio
-import platform
+import subprocess
 import shutil
 from io import BytesIO
 from pathlib import Path
@@ -22,6 +21,7 @@ import sqlite3
 
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, FSInputFile, BufferedInputFile, Document
 )
@@ -39,7 +39,7 @@ try:
 except Exception:
     HAS_MPL = False
 
-# Optional AI helper (used to add a brief natural language explanation)
+# Optional AI helper (brief NL explanations)
 try:
     from SafoneAPI import SafoneAPI
     HAS_SAFONE = True
@@ -68,7 +68,7 @@ DB_PATH = Path(os.getenv("DB_PATH") or "data/bot.db")
 DATA_DIR = Path(os.getenv("DATA_DIR") or "exports")
 BOT_PIN = os.getenv("BOT_PIN")  # optional
 
-KEEP_LAST_BOT_MSGS_DEFAULT = int(os.getenv("KEEP_LAST_BOT_MSGS") or "1")  # default fallback
+KEEP_LAST_BOT_MSGS = int(os.getenv("KEEP_LAST_BOT_MSGS") or "1")  # keep newest N messages
 
 # Reminders (defaults)
 DAILY_REMINDERS = int(os.getenv("DAILY_REMINDERS") or "1")
@@ -77,7 +77,7 @@ DAILY_HOUR = int(os.getenv("DAILY_HOUR") or "9")
 WEEKLY_DOW = int(os.getenv("WEEKLY_DOW") or "1")  # 0=Mon
 
 TZ = ZoneInfo("Asia/Kolkata")
-CURRENCY = os.getenv("CURRENCY") or "₹"  # mutable via Extras
+CURRENCY = os.getenv("CURRENCY") or "₹"
 
 assert BOT_TOKEN, "BOT_TOKEN env is required"
 assert OWNER_ID, "OWNER_ID env is required"
@@ -152,59 +152,29 @@ def init_db():
         msg_id INTEGER NOT NULL,
         ts INTEGER NOT NULL
     )""")
-    con.commit(); con.close()
+    con.commit()
+    con.close()
+    migrate_columns()
 
-def migrate_settings_extras():
-    """Add new settings columns if missing (idempotent)."""
+def migrate_columns():
+    """Add new settings columns if missing."""
     con = db(); cur = con.cursor()
     cur.execute("PRAGMA table_info(settings)")
     cols = {r["name"] for r in cur.fetchall()}
-
-    to_add = []
-    if "delete_user_msgs" not in cols:
-        to_add.append(("ALTER TABLE settings ADD COLUMN delete_user_msgs INTEGER DEFAULT 1",))
-    if "keep_last_bot_msgs" not in cols:
-        to_add.append(("ALTER TABLE settings ADD COLUMN keep_last_bot_msgs INTEGER DEFAULT ?", (KEEP_LAST_BOT_MSGS_DEFAULT,)))
-    if "currency" not in cols:
-        to_add.append(("ALTER TABLE settings ADD COLUMN currency TEXT",))
-
-    for stmt in to_add:
-        if len(stmt) == 1:
-            cur.execute(stmt[0])
-        else:
-            cur.execute(stmt[0], stmt[1])
+    if "auto_delete_user" not in cols:
+        cur.execute("ALTER TABLE settings ADD COLUMN auto_delete_user INTEGER DEFAULT 1")
     con.commit()
-
-    # Ensure row for OWNER_ID exists & defaults applied
-    cur.execute("SELECT 1 FROM settings WHERE user_id=?", (OWNER_ID,))
-    if not cur.fetchone():
-        cur.execute("""INSERT INTO settings (user_id, daily_reminders, weekly_reminders, daily_hour, weekly_dow,
-                    delete_user_msgs, keep_last_bot_msgs, currency)
-                    VALUES (?,?,?,?,?,?,?,?)""",
-                    (OWNER_ID, DAILY_REMINDERS, WEEKLY_REMINDERS, DAILY_HOUR, WEEKLY_DOW, 1, KEEP_LAST_BOT_MSGS_DEFAULT, CURRENCY))
-    else:
-        # backfill nulls
-        cur.execute("UPDATE settings SET delete_user_msgs=COALESCE(delete_user_msgs,1) WHERE user_id=?", (OWNER_ID,))
-        cur.execute("UPDATE settings SET keep_last_bot_msgs=COALESCE(keep_last_bot_msgs,?) WHERE user_id=?", (KEEP_LAST_BOT_MSGS_DEFAULT, OWNER_ID))
-        cur.execute("UPDATE settings SET currency=COALESCE(currency,?) WHERE user_id=?", (CURRENCY, OWNER_ID))
-    con.commit(); con.close()
+    con.close()
 
 def migrate_defaults():
-    init_db()
     con = db(); cur = con.cursor()
     cur.execute("SELECT 1 FROM settings WHERE user_id=?", (OWNER_ID,))
     if not cur.fetchone():
-        cur.execute("""INSERT INTO settings (user_id, daily_reminders, weekly_reminders, daily_hour, weekly_dow)
-                       VALUES (?,?,?,?,?)""",
-                    (OWNER_ID, DAILY_REMINDERS, WEEKLY_REMINDERS, DAILY_HOUR, WEEKLY_DOW))
+        cur.execute("""INSERT INTO settings (user_id, daily_reminders, weekly_reminders, daily_hour, weekly_dow, auto_delete_user)
+                       VALUES (?,?,?,?,?,?)""",
+                    (OWNER_ID, DAILY_REMINDERS, WEEKLY_REMINDERS, DAILY_HOUR, WEEKLY_DOW, 1))
         con.commit()
     con.close()
-    migrate_settings_extras()
-    # sync currency global from DB
-    s = get_settings(OWNER_ID)
-    global CURRENCY
-    if s and s["currency"]:
-        CURRENCY = s["currency"]
 
 # ---------- Utils ----------
 def now_ts() -> int:
@@ -241,32 +211,6 @@ def parse_date_fuzzy(s: str) -> Optional[datetime]:
 def canonical(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower())).strip()
 
-# settings helpers
-def get_settings(user_id: int) -> sqlite3.Row:
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT * FROM settings WHERE user_id=?", (user_id,))
-    row = cur.fetchone(); con.close(); return row
-
-def set_setting(user_id: int, field: str, value):
-    con = db(); cur = con.cursor()
-    cur.execute(f"UPDATE settings SET {field}=? WHERE user_id=?", (value, user_id))
-    con.commit(); con.close()
-
-def get_keep_last(user_id: int) -> int:
-    s = get_settings(user_id)
-    if not s: return KEEP_LAST_BOT_MSGS_DEFAULT
-    return int(s["keep_last_bot_msgs"] if s["keep_last_bot_msgs"] is not None else KEEP_LAST_BOT_MSGS_DEFAULT)
-
-def get_delete_user_msgs(user_id: int) -> bool:
-    s = get_settings(user_id)
-    return bool(s["delete_user_msgs"] if s and s["delete_user_msgs"] is not None else 1)
-
-def set_currency(user_id: int, symbol: str):
-    symbol = (symbol or "₹").strip()[:3]
-    set_setting(user_id, "currency", symbol)
-    global CURRENCY
-    CURRENCY = symbol
-
 # ---------- Data ops ----------
 def add_expense(user_id: int, amount: float, note: Optional[str], category: Optional[str]) -> int:
     con = db(); cur = con.cursor()
@@ -300,6 +244,27 @@ def add_person(user_id: int, display_name: str) -> Tuple[Optional[int], Optional
         con.commit(); pid = cur.lastrowid; con.close(); return pid, None
     except sqlite3.IntegrityError:
         con.close(); return None, "This person already exists."
+
+def rename_person(user_id: int, person_id: int, new_name: str) -> bool:
+    new_name = new_name.strip()
+    if not new_name: return False
+    con = db(); cur = con.cursor()
+    try:
+        cur.execute("UPDATE people SET display_name=?, canonical_name=? WHERE user_id=? AND id=?",
+                    (new_name, new_name.lower(), user_id, person_id))
+        con.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        con.close()
+
+def merge_people(user_id: int, src_id: int, dst_id: int) -> None:
+    con = db(); cur = con.cursor()
+    cur.execute("UPDATE ledger SET person_id=? WHERE user_id=? AND person_id=?", (dst_id, user_id, src_id))
+    cur.execute("DELETE FROM people WHERE user_id=? AND id=?", (user_id, src_id))
+    con.commit()
+    con.close()
 
 def get_people(user_id: int) -> List[sqlite3.Row]:
     con = db(); cur = con.cursor()
@@ -392,7 +357,8 @@ def get_person_interest_info(user_id: int, person_id: int) -> Tuple[Optional[flo
 
 def update_last_interest_applied(user_id: int, person_id: int, yyyymm: str):
     con = db(); cur = con.cursor()
-    cur.execute("UPDATE people SET last_interest_yyyymm=? WHERE user_id=? AND id=?", (yyyymm, user_id, person_id))
+    cur.execute("UPDATE people SET last_interest_yyyymm=? WHERE user_id=? AND id=?",
+                (yyyymm, user_id, person_id))
     con.commit(); con.close()
 
 def top_balances(user_id: int, limit: int=5) -> List[sqlite3.Row]:
@@ -411,7 +377,7 @@ def top_balances(user_id: int, limit: int=5) -> List[sqlite3.Row]:
     rows = cur.fetchall(); con.close(); return rows
 
 def due_items(user_id: int, days: int=7) -> List[sqlite3.Row]:
-    now = now_ts(); soon = now + days*24*3600
+    nowt = now_ts(); soon = nowt + days*24*3600
     con = db(); cur = con.cursor()
     cur.execute("""
     SELECT p.display_name AS name, l.amount, l.due_ts
@@ -441,6 +407,17 @@ def undo_last(user_id: int) -> str:
     con.commit(); con.close()
     return f"Undid last {kind}."
 
+# Settings
+def get_settings(user_id: int) -> sqlite3.Row:
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT * FROM settings WHERE user_id=?", (user_id,))
+    row = cur.fetchone(); con.close(); return row
+
+def set_setting(user_id: int, field: str, value):
+    con = db(); cur = con.cursor()
+    cur.execute(f"UPDATE settings SET {field}=? WHERE user_id=?", (value, user_id))
+    con.commit(); con.close()
+
 # Bot message log
 def record_bot_message(user_id: int, chat_id: int, msg_id: int):
     con = db(); cur = con.cursor()
@@ -453,6 +430,7 @@ def record_bot_message(user_id: int, chat_id: int, msg_id: int):
 async def delete_old_bot_messages(chat_id: int, keep_last: int=0):
     """
     Deletes older bot messages in this chat, keeping the newest `keep_last`.
+    (Fix) We no longer purge kept rows from DB so cleanup keeps working reliably.
     """
     con = db(); cur = con.cursor()
     cur.execute("SELECT id, msg_id FROM bot_msgs WHERE user_id=? AND chat_id=? ORDER BY id DESC", (OWNER_ID, chat_id))
@@ -484,6 +462,7 @@ async def delete_old_bot_messages(chat_id: int, keep_last: int=0):
 async def wipe_ui(chat_id: int, source_message: Optional[Message]=None, keep_last:int=0):
     """
     Deletes the tapped message (old menu) immediately and wipes previous bot UI.
+    Note: Telegram can delete bot's own messages; user messages handled by middleware.
     """
     if source_message:
         try:
@@ -527,53 +506,39 @@ def export_expenses_csv(user_id: int) -> Path:
         for r in rows:
             dt = datetime.fromtimestamp(r["ts"], TZ).strftime("%Y-%m-%d %H:%M")
             w.writerow([dt, r["yyyymm"], float(r[2]), r[3], r[4]])
-        w.writerow([]); this_month = cur_yyyymm()
+        w.writerow([])
+        this_month = cur_yyyymm()
         w.writerow([f"THIS MONTH ({this_month})", "", monthly_total(user_id, this_month), "", ""])
     return fpath
 
-def export_expenses_month_csv(user_id: int, yyyymm: Optional[str]=None) -> Path:
-    yyyymm = yyyymm or cur_yyyymm()
+def export_month_csv(user_id: int, yyyymm: Optional[str]=None) -> Path:
+    month = yyyymm or cur_yyyymm()
     con = db(); cur = con.cursor()
     cur.execute("""SELECT ts, amount, COALESCE(note,''), COALESCE(category,'Other')
-                   FROM expenses WHERE user_id=? AND yyyymm=? ORDER BY ts ASC""", (user_id, yyyymm))
+                   FROM expenses WHERE user_id=? AND yyyymm=? ORDER BY ts ASC""",
+                (user_id, month))
     rows = cur.fetchall(); con.close()
     out_dir = DATA_DIR / f"user_{user_id}"; out_dir.mkdir(parents=True, exist_ok=True)
     ts_str = datetime.now(TZ).strftime("%Y-%m-%d_%H-%M")
-    fpath = out_dir / f"expenses_{yyyymm}_{ts_str}.csv"
+    fpath = out_dir / f"expenses_{month}_{ts_str}.csv"
     with open(fpath, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["DateTime(IST)","Amount","Note","Category"])
         for r in rows:
             dt = datetime.fromtimestamp(r["ts"], TZ).strftime("%Y-%m-%d %H:%M")
             w.writerow([dt, float(r["amount"]), r[2], r[3]])
-        w.writerow([]); w.writerow(["TOTAL", monthly_total(user_id, yyyymm), "", ""])
+        w.writerow([]); w.writerow(["TOTAL", monthly_total(user_id, month), "", ""])
     return fpath
 
-def export_dues_csv(user_id: int, days:int=30) -> Path:
-    rows = due_items(user_id, days)
+def export_top_balances_txt(user_id: int, limit: int=20) -> Path:
     out_dir = DATA_DIR / f"user_{user_id}"; out_dir.mkdir(parents=True, exist_ok=True)
     ts_str = datetime.now(TZ).strftime("%Y-%m-%d_%H-%M")
-    fpath = out_dir / f"dues_{days}d_{ts_str}.csv"
-    with open(fpath, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["Name","Amount","DueDate"])
-        for r in rows:
-            when = datetime.fromtimestamp(r["due_ts"], TZ).strftime("%Y-%m-%d")
-            w.writerow([r["name"], float(r["amount"]), when])
-    return fpath
-
-def export_people_summary_csv(user_id: int) -> Path:
-    people = get_people(user_id)
-    out_dir = DATA_DIR / f"user_{user_id}"; out_dir.mkdir(parents=True, exist_ok=True)
-    ts_str = datetime.now(TZ).strftime("%Y-%m-%d_%H-%M")
-    fpath = out_dir / f"people_summary_{ts_str}.csv"
-    with open(fpath, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["Name","Balance","CreditLimit","MonthlyInterest%"])
-        for p in people:
-            bal = person_balance(user_id, p["id"])
-            w.writerow([p["display_name"], bal, p["credit_limit"] or "", p["monthly_interest_rate"] or ""])
-    return fpath
+    path = out_dir / f"top_balances_{ts_str}.txt"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("Top balances\n")
+        for r in top_balances(user_id, limit):
+            f.write(f"{r['display_name']}: {CURRENCY}{float(r['bal']):,.2f}\n")
+    return path
 
 def export_all_zip(user_id: int) -> Path:
     out_dir = DATA_DIR / f"user_{user_id}"; out_dir.mkdir(parents=True, exist_ok=True)
@@ -611,35 +576,6 @@ def render_category_chart_png(user_id: int, yyyymm: Optional[str]=None) -> Optio
     buf = BytesIO(); fig.tight_layout(); fig.savefig(buf, format="png"); plt.close(fig)
     return buf.getvalue()
 
-def render_monthly_trend_png(user_id: int, months: int=6) -> Optional[bytes]:
-    if not HAS_MPL: return None
-    now = datetime.now(TZ)
-    labels = []
-    values = []
-    for i in range(months-1, -1, -1):
-        d = (now.replace(day=1) - timedelta(days=1)).replace(day=1)  # ensure valid
-        # safer month back calc
-    # compute months list correctly
-    labels = []
-    values = []
-    cur = datetime.now(TZ).replace(day=1)
-    seq = []
-    for i in range(months-1, -1, -1):
-        y = cur.year
-        m = cur.month
-        # go back i months
-        total_months = y*12 + m - 1 - i
-        y2 = total_months // 12
-        m2 = total_months % 12 + 1
-        yyyymm = f"{y2:04d}-{m2:02d}"
-        labels.append(yyyymm)
-        values.append(monthly_total(user_id, yyyymm))
-    fig = plt.figure()
-    plt.plot(labels, values, marker="o"); plt.title(f"Monthly Spend (last {months})")
-    plt.xlabel("Month"); plt.ylabel("Amount"); plt.xticks(rotation=45)
-    buf = BytesIO(); fig.tight_layout(); fig.savefig(buf, format="png"); plt.close(fig)
-    return buf.getvalue()
-
 # ---------- Bot setup (aiogram ≥3.7 compatible) ----------
 try:
     from aiogram.client.default import DefaultBotProperties
@@ -660,40 +596,43 @@ def only_owner(x) -> bool:
 def deny_text() -> str:
     return "⛔️ This bot is private."
 
-# ---------- Middleware: auto-delete user messages in private ----------
+# ---------- Middleware: delete user's message in private ----------
 class PrivateAutoDelete(BaseMiddleware):
     async def __call__(self, handler, event, data):
+        # Handle first
         result = await handler(event, data)
         try:
-            if isinstance(event, Message) and event.chat and event.chat.type == "private":
-                if event.from_user and event.from_user.id == OWNER_ID and get_delete_user_msgs(OWNER_ID):
-                    # Delete user's message AFTER we processed it
-                    await bot.delete_message(event.chat.id, event.message_id)
+            if isinstance(event, Message) and event.chat.type == "private":
+                s = get_settings(OWNER_ID)
+                if s and int(s.get("auto_delete_user", 1)) == 1:
+                    try:
+                        await event.bot.delete_message(chat_id=event.chat.id, message_id=event.message_id)
+                    except Exception:
+                        pass
         except Exception:
             pass
         return result
 
-# Register global middleware
-dp.update.middleware.register(PrivateAutoDelete())
+dp.message.middleware(PrivateAutoDelete())
 
 # ---------- send helpers with auto-clean ----------
 async def send_text(chat_id: int, text: str, kb=None):
     if not text: text = "‎"
     msg = await bot.send_message(chat_id, text, reply_markup=kb)
     record_bot_message(OWNER_ID, chat_id, msg.message_id)
-    await delete_old_bot_messages(chat_id, keep_last=get_keep_last(OWNER_ID))
+    await delete_old_bot_messages(chat_id, keep_last=KEEP_LAST_BOT_MSGS)
     return msg
 
 async def send_photo(chat_id: int, photo_bytes: bytes, filename: str, caption: str, kb=None):
     msg = await bot.send_photo(chat_id, BufferedInputFile(photo_bytes, filename=filename), caption=caption, reply_markup=kb)
     record_bot_message(OWNER_ID, chat_id, msg.message_id)
-    await delete_old_bot_messages(chat_id, keep_last=get_keep_last(OWNER_ID))
+    await delete_old_bot_messages(chat_id, keep_last=KEEP_LAST_BOT_MSGS)
     return msg
 
 async def send_document(chat_id: int, path: Path, caption: str="", kb=None):
     msg = await bot.send_document(chat_id, FSInputFile(path), caption=caption, reply_markup=kb)
     record_bot_message(OWNER_ID, chat_id, msg.message_id)
-    await delete_old_bot_messages(chat_id, keep_last=get_keep_last(OWNER_ID))
+    await delete_old_bot_messages(chat_id, keep_last=KEEP_LAST_BOT_MSGS)
     return msg
 
 async def safe_edit(message, text: str, kb=None):
@@ -718,10 +657,10 @@ def main_kb():
     kb.button(text="🔔 Reminders", callback_data="reminders")
     kb.button(text="↩️ Undo", callback_data="undo")
     kb.button(text="📁 Export All (ZIP)", callback_data="export_all")
+    kb.button(text="🧰 Extras", callback_data="extras")
     kb.button(text="🧼 Reset All", callback_data="reset_all_confirm")
     kb.button(text="ℹ️ Quick Add Help", callback_data="help_quick")
-    kb.button(text="⚙️ Extras", callback_data="extras")
-    kb.adjust(2,2,2,3,2,1)
+    kb.adjust(2,2,2,3,2)
     return kb.as_markup()
 
 def people_kb(user_id: int):
@@ -745,9 +684,10 @@ def person_menu_kb(pid: int):
     kb.button(text="💠 Set Interest %", callback_data=f"setinterest:{pid}")
     kb.button(text="🗒 Ledger", callback_data=f"ledger:{pid}")
     kb.button(text="📄 Export", callback_data=f"export_person:{pid}")
+    kb.button(text="✏️ Rename", callback_data=f"po_rename:{pid}")
     kb.button(text="🗑 Remove", callback_data=f"person_delete_confirm:{pid}")
     kb.button(text="⬅️ Back", callback_data="people")
-    kb.adjust(2,2,2,2)
+    kb.adjust(2,2,2,2,2)
     return kb.as_markup()
 
 def reminders_kb():
@@ -774,19 +714,6 @@ def reset_confirm_kb():
     kb.adjust(1)
     return kb.as_markup()
 
-def support_person_kb(pid: int):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Lend", callback_data=f"lend:{pid}")
-    kb.button(text="💸 Repay", callback_data=f"repay:{pid}")
-    kb.button(text="🗒 Ledger", callback_data=f"ledger:{pid}")
-    kb.button(text="🎯 Limit", callback_data=f"setlimit:{pid}")
-    kb.button(text="💠 Interest %", callback_data=f"setinterest:{pid}")
-    kb.button(text="📄 Export", callback_data=f"export_person:{pid}")
-    kb.button(text="🗑 Delete", callback_data=f"person_delete_confirm:{pid}")
-    kb.button(text="⬅️ Main", callback_data="back_main")
-    kb.adjust(2,2,2,2)
-    return kb.as_markup()
-
 def import_summary_kb(has_issues: bool):
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Apply Import", callback_data="import_apply")
@@ -799,35 +726,51 @@ def import_summary_kb(has_issues: bool):
     kb.adjust(2,2,2)
     return kb.as_markup()
 
-def extras_kb():
+# Extras hub keyboards
+def extras_root_kb():
     kb = InlineKeyboardBuilder()
-    # Dev / Ops
-    kb.button(text="🔄 Update Code (pull+install)", callback_data="dev_update")
-    kb.button(text="♻️ Restart Service", callback_data="dev_restart")
-    kb.button(text="📜 Tail Logs", callback_data="dev_logs")
-    kb.button(text="🩺 Health Check", callback_data="dev_health")
-    # Maintenance
-    kb.button(text="🧹 Purge UI Now", callback_data="purge_ui")
-    kb.button(text="💾 Backup DB", callback_data="backup_db")
-    kb.button(text="♻️ Restore DB", callback_data="restore_db")
-    kb.button(text="🧰 Optimize DB (VACUUM)", callback_data="optimize_db")
-    # Analytics
-    kb.button(text="📈 Trend 6 mo", callback_data="trend6")
-    kb.button(text="📑 Export People Summary", callback_data="export_people")
-    kb.button(text="🧾 Export This Month CSV", callback_data="export_month_csv")
-    kb.button(text="⏰ Export Dues CSV", callback_data="export_dues_csv")
-    # Controls
-    kb.button(text="🧮 Apply Interest Now", callback_data="interest_now")
-    kb.button(text="📬 Send Daily Summary", callback_data="send_daily")
-    kb.button(text="🗞 Weekly Digest Now", callback_data="send_weekly")
-    kb.button(text="🔎 Search Person", callback_data="search_person")
-    kb.button(text="👥 Find Duplicates", callback_data="dup_check")
-    kb.button(text=f"🧽 Delete user msgs: {'ON' if get_delete_user_msgs(OWNER_ID) else 'OFF'}", callback_data="toggle_del_user")
-    kb.button(text=f"🧼 Keep Last UI: {get_keep_last(OWNER_ID)}", callback_data="set_keep_last")
-    kb.button(text=f"💱 Currency: {CURRENCY}", callback_data="set_currency")
-    kb.button(text="🔒 Lock Now", callback_data="lock_now")
-    kb.button(text="⬅️ Back", callback_data="back_main")
-    kb.adjust(2,2,2,2,2,2,2,2,1,1)
+    kb.button(text="🧩 Utilities", callback_data="ex_util")
+    kb.button(text="👥 People Ops", callback_data="ex_people")
+    kb.button(text="🛠 Dev Tools", callback_data="ex_dev")
+    kb.button(text="⬅️ Main", callback_data="back_main")
+    kb.adjust(2,1,1)
+    return kb.as_markup()
+
+def extras_util_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🧹 Clear UI now", callback_data="util_clear_ui")
+    kb.button(text="🗑 Auto-delete user msgs: TOGGLE", callback_data="util_toggle_autodel")
+    kb.button(text="💱 Change Currency", callback_data="util_currency")
+    kb.button(text="📄 CSV Template", callback_data="util_template")
+    kb.button(text="🧽 VACUUM DB", callback_data="util_vacuum")
+    kb.button(text="💾 Backup DB", callback_data="util_backup_db")
+    kb.button(text="📂 Show Paths & Sizes", callback_data="util_show_paths")
+    kb.button(text="🛠 Rebuild Month Cache", callback_data="util_rebuild_yyyymm")
+    kb.button(text="📤 Export Current Month", callback_data="util_export_month")
+    kb.button(text="👑 Export Top Balances", callback_data="util_export_top")
+    kb.button(text="⬅️ Extras", callback_data="extras")
+    kb.adjust(2,2,2,2,2,1)
+    return kb.as_markup()
+
+def extras_people_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔎 Search Person", callback_data="po_search")
+    kb.button(text="🔁 Merge People", callback_data="po_merge")
+    kb.button(text="🧼 Remove Zero-Balance", callback_data="po_delete_zero")
+    kb.button(text="💠 Set Global Interest %", callback_data="po_set_global_interest")
+    kb.button(text="⬅️ Extras", callback_data="extras")
+    kb.adjust(2,2,1)
+    return kb.as_markup()
+
+def extras_dev_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬇️ Update Code", callback_data="dev_update")
+    kb.button(text="🔁 Restart Service", callback_data="dev_restart")
+    kb.button(text="🟢 Status", callback_data="dev_status")
+    kb.button(text="📜 Logs (80)", callback_data="dev_logs")
+    kb.button(text="🌿 Git Info", callback_data="dev_gitinfo")
+    kb.button(text="⬅️ Extras", callback_data="extras")
+    kb.adjust(2,2,2)
     return kb.as_markup()
 
 # ---------- States ----------
@@ -871,15 +814,15 @@ class ImportState(StatesGroup):
 class SupportAIState(StatesGroup):
     waiting_query = State()
 
-# NEW – Extras states
-class RestoreDBState(StatesGroup):
-    waiting_db = State()
-
-class SearchPersonState(StatesGroup):
-    waiting_query = State()
-
-class CurrencyState(StatesGroup):
-    waiting_symbol = State()
+# Extras states
+class ExtrasState(StatesGroup):
+    waiting_search = State()
+    waiting_currency = State()
+    waiting_merge_src = State()
+    waiting_merge_dst = State()
+    waiting_global_rate = State()
+    waiting_rename_new = State()
+    # store working ids in FSM data
 
 # ---------- Handlers ----------
 @router.message(CommandStart())
@@ -888,7 +831,7 @@ async def start_cmd(m: Message):
         if not only_owner(m): return await m.answer(deny_text())
         if BOT_PIN and m.from_user.id not in UNLOCKED:
             return await m.answer("🔒 Enter PIN to unlock:")
-        migrate_defaults()
+        init_db(); migrate_defaults()
         await delete_old_bot_messages(m.chat.id, keep_last=0)  # hard wipe
         await send_text(
             m.chat.id,
@@ -919,15 +862,6 @@ async def back_main(c: CallbackQuery):
     except Exception as e:
         await c.message.answer(f"❌ back error: {e}")
 
-@router.callback_query(F.data == "extras")
-async def extras(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
-        await send_text(c.message.chat.id, "⚙️ <b>Extras</b>", extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ extras error: {e}")
-
 # Quick Add Help
 @router.callback_query(F.data == "help_quick")
 async def help_quick(c: CallbackQuery):
@@ -945,7 +879,423 @@ async def help_quick(c: CallbackQuery):
     except Exception as e:
         await c.message.answer(f"❌ help error: {e}")
 
-# Add Expense flow
+# ----------------- EXTRAS HUB -----------------
+@router.callback_query(F.data == "extras")
+async def cb_extras(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
+        await send_text(c.message.chat.id, "🧰 <b>Extras</b>", extras_root_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ extras error: {e}")
+
+@router.callback_query(F.data == "ex_util")
+async def cb_ex_util(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
+        await send_text(c.message.chat.id, "🧩 <b>Utilities</b>", extras_util_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ util ui error: {e}")
+
+@router.callback_query(F.data == "ex_people")
+async def cb_ex_people(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
+        await send_text(c.message.chat.id, "👥 <b>People Ops</b>", extras_people_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ people ops ui error: {e}")
+
+@router.callback_query(F.data == "ex_dev")
+async def cb_ex_dev(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
+        await send_text(c.message.chat.id, "🛠 <b>Dev Tools</b>", extras_dev_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ dev ui error: {e}")
+
+# ---------- Utilities (10) ----------
+@router.callback_query(F.data == "util_clear_ui")
+async def util_clear_ui(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await delete_old_bot_messages(c.message.chat.id, keep_last=0)
+        await send_text(c.message.chat.id, "🧹 Cleared.", extras_util_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ clear ui error: {e}")
+
+@router.callback_query(F.data == "util_toggle_autodel")
+async def util_toggle_autodel(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        s = get_settings(OWNER_ID)
+        newv = 0 if int(s["auto_delete_user"] or 1) == 1 else 1
+        set_setting(OWNER_ID, "auto_delete_user", newv)
+        await send_text(c.message.chat.id, f"🗑 Auto-delete user messages: {'ON' if newv else 'OFF'}", extras_util_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ toggle autodel error: {e}")
+
+@router.callback_query(F.data == "util_currency")
+async def util_currency(c: CallbackQuery, state: FSMContext):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
+        await state.set_state(ExtrasState.waiting_currency)
+        await send_text(c.message.chat.id, "💱 Send new currency symbol (e.g., ₹, $, €):")
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ currency ui error: {e}")
+
+@router.message(ExtrasState.waiting_currency)
+async def util_currency_set(m: Message, state: FSMContext):
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        sym = (m.text or "").strip()[:3]
+        if not sym:
+            return await send_text(m.chat.id, "⚠️ Invalid symbol.", extras_util_kb())
+        # update in-memory and persist to .env if present
+        global CURRENCY
+        CURRENCY = sym
+        envp = Path(".env")
+        try:
+            if envp.exists():
+                txt = envp.read_text(encoding="utf-8")
+                if re.search(r"^CURRENCY\s*=", txt, flags=re.M):
+                    txt = re.sub(r"^CURRENCY\s*=.*$", f"CURRENCY={sym}", txt, flags=re.M)
+                else:
+                    txt += f"\nCURRENCY={sym}\n"
+                envp.write_text(txt, encoding="utf-8")
+        except Exception:
+            pass
+        await state.clear()
+        await send_text(m.chat.id, f"✅ Currency set to {sym}", extras_util_kb())
+    except Exception as e:
+        await state.clear()
+        await m.answer(f"❌ currency set error: {e}", reply_markup=extras_util_kb())
+
+@router.callback_query(F.data == "util_template")
+async def util_template(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        out_dir = DATA_DIR / f"user_{OWNER_ID}"; out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / "import_template.csv"
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["person","type(lend|repay)","amount","note","duedate(YYYY-MM-DD)"])
+            w.writerow(["Ajay","lend","500","cab","2025-09-05"])
+            w.writerow(["Raj","repay","200","cash",""])
+            w.writerow([])
+            w.writerow(["-- OR Expenses sheet below --"])
+            w.writerow(["date","amount","note","category"])
+            w.writerow(["2025-09-01","120","breakfast","Food"])
+        await send_document(c.message.chat.id, path, caption="📄 Import CSV Template", extras_util_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ template error: {e}")
+
+@router.callback_query(F.data == "util_vacuum")
+async def util_vacuum(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        con = db(); cur = con.cursor()
+        cur.execute("VACUUM")
+        con.commit(); con.close()
+        await send_text(c.message.chat.id, "🧽 DB vacuum completed.", extras_util_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ vacuum error: {e}")
+
+@router.callback_query(F.data == "util_backup_db")
+async def util_backup_db(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        backup = DATA_DIR / f"user_{OWNER_ID}" / f"db_backup_{datetime.now(TZ).strftime('%Y-%m-%d_%H-%M')}.sqlite3"
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(DB_PATH, backup)
+        await send_document(c.message.chat.id, backup, caption="💾 DB backup", kb=extras_util_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ backup error: {e}")
+
+@router.callback_query(F.data == "util_show_paths")
+async def util_show_paths(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+        exports = DATA_DIR / f"user_{OWNER_ID}"
+        exp_ct = len(list(exports.glob("*"))) if exports.exists() else 0
+        text = (f"📂 <b>Paths</b>\n"
+                f"• DB: <code>{DB_PATH}</code> ({db_size/1024:.1f} KB)\n"
+                f"• Data dir: <code>{exports}</code> (files: {exp_ct})")
+        await send_text(c.message.chat.id, text, extras_util_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ paths error: {e}")
+
+def rebuild_expense_months(user_id: int) -> int:
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT id, ts FROM expenses WHERE user_id=?", (user_id,))
+    rows = cur.fetchall()
+    upd = 0
+    for r in rows:
+        yyyymm = datetime.fromtimestamp(r["ts"], TZ).strftime("%Y-%m")
+        cur.execute("UPDATE expenses SET yyyymm=? WHERE id=?", (yyyymm, r["id"]))
+        upd += 1
+    con.commit(); con.close()
+    return upd
+
+@router.callback_query(F.data == "util_rebuild_yyyymm")
+async def util_rebuild_yyyymm(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        n = rebuild_expense_months(OWNER_ID)
+        await send_text(c.message.chat.id, f"🛠 Rebuilt yyyymm for {n} rows.", extras_util_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ rebuild error: {e}")
+
+@router.callback_query(F.data == "util_export_month")
+async def util_export_month(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        path = export_month_csv(OWNER_ID, cur_yyyymm())
+        await send_document(c.message.chat.id, path, caption="📤 Current month expenses", kb=extras_util_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ export month error: {e}")
+
+@router.callback_query(F.data == "util_export_top")
+async def util_export_top(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        path = export_top_balances_txt(OWNER_ID, 20)
+        await send_document(c.message.chat.id, path, caption="👑 Top balances", kb=extras_util_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ export top error: {e}")
+
+# ---------- People Ops (4) ----------
+@router.callback_query(F.data == "po_search")
+async def po_search(c: CallbackQuery, state: FSMContext):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
+        await state.set_state(ExtrasState.waiting_search)
+        await send_text(c.message.chat.id, "🔎 Send part of the name to search:")
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ search ui error: {e}")
+
+@router.message(ExtrasState.waiting_search)
+async def po_search_go(m: Message, state: FSMContext):
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        q = (m.text or "").strip().lower()
+        hits = []
+        for p in get_people(OWNER_ID):
+            if q in p["display_name"].lower():
+                bal = person_balance(OWNER_ID, p["id"])
+                hits.append(f"• {p['id']}: {p['display_name']} ({CURRENCY}{bal:,.2f})")
+        await state.clear()
+        if not hits:
+            return await send_text(m.chat.id, "No matches.", extras_people_kb())
+        await send_text(m.chat.id, "Results:\n" + "\n".join(hits), extras_people_kb())
+    except Exception as e:
+        await state.clear()
+        await m.answer(f"❌ search error: {e}", reply_markup=extras_people_kb())
+
+@router.callback_query(F.data.startswith("po_rename:"))
+async def po_rename_start(c: CallbackQuery, state: FSMContext):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        pid = int(c.data.split(":")[1])
+        await state.set_state(ExtrasState.waiting_rename_new)
+        await state.update_data(rename_pid=pid)
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
+        await send_text(c.message.chat.id, "✏️ Send new name for this person:")
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ rename ui error: {e}")
+
+@router.message(ExtrasState.waiting_rename_new)
+async def po_rename_do(m: Message, state: FSMContext):
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        data = await state.get_data()
+        pid = int(data.get("rename_pid"))
+        newname = (m.text or "").strip()
+        ok = rename_person(OWNER_ID, pid, newname)
+        await state.clear()
+        if not ok:
+            return await send_text(m.chat.id, "⚠️ Rename failed (maybe duplicate).", people_kb(OWNER_ID))
+        await send_text(m.chat.id, f"✅ Renamed to <b>{newname}</b>.", people_kb(OWNER_ID))
+    except Exception as e:
+        await state.clear()
+        await m.answer(f"❌ rename error: {e}", reply_markup=people_kb(OWNER_ID))
+
+@router.callback_query(F.data == "po_merge")
+async def po_merge_a(c: CallbackQuery, state: FSMContext):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await state.set_state(ExtrasState.waiting_merge_src)
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
+        await send_text(c.message.chat.id, "🔁 Send SOURCE person name (the one to merge FROM):")
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ merge ui error: {e}")
+
+@router.message(ExtrasState.waiting_merge_src)
+async def po_merge_b(m: Message, state: FSMContext):
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        pid, disp = resolve_person_id(OWNER_ID, m.text or "")
+        if not pid: return await send_text(m.chat.id, "⚠️ Not found. Try again via Extras → People Ops.", extras_people_kb())
+        await state.update_data(merge_src=pid)
+        await state.set_state(ExtrasState.waiting_merge_dst)
+        await send_text(m.chat.id, f"Source: <b>{disp}</b>\nNow send DESTINATION person name (merge INTO):")
+    except Exception as e:
+        await state.clear()
+        await m.answer(f"❌ merge step error: {e}", reply_markup=extras_people_kb())
+
+@router.message(ExtrasState.waiting_merge_dst)
+async def po_merge_c(m: Message, state: FSMContext):
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        data = await state.get_data()
+        src = int(data.get("merge_src"))
+        dst, disp = resolve_person_id(OWNER_ID, m.text or "")
+        if not dst: 
+            await state.clear()
+            return await send_text(m.chat.id, "⚠️ Destination not found.", extras_people_kb())
+        if src == dst:
+            await state.clear()
+            return await send_text(m.chat.id, "⚠️ Same person. Cancelled.", extras_people_kb())
+        merge_people(OWNER_ID, src, dst)
+        await state.clear()
+        await send_text(m.chat.id, f"✅ Merged into <b>{disp}</b>.", people_kb(OWNER_ID))
+    except Exception as e:
+        await state.clear()
+        await m.answer(f"❌ merge error: {e}", reply_markup=extras_people_kb())
+
+@router.callback_query(F.data == "po_delete_zero")
+async def po_delete_zero(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        removed = 0
+        for p in get_people(OWNER_ID):
+            if abs(person_balance(OWNER_ID, p["id"])) < 1e-9:
+                delete_person(OWNER_ID, p["id"]); removed += 1
+        await send_text(c.message.chat.id, f"🧼 Removed {removed} zero-balance people.", extras_people_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ delete zero error: {e}")
+
+@router.callback_query(F.data == "po_set_global_interest")
+async def po_global_interest(c: CallbackQuery, state: FSMContext):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await state.set_state(ExtrasState.waiting_global_rate)
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
+        await send_text(c.message.chat.id, "💠 Send interest % to apply to all people without a rate (e.g., 2):")
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ global interest ui error: {e}")
+
+@router.message(ExtrasState.waiting_global_rate)
+async def po_global_interest_set(m: Message, state: FSMContext):
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        try:
+            rate = float((m.text or "").strip())
+            assert rate >= 0
+        except Exception:
+            await state.clear()
+            return await send_text(m.chat.id, "⚠️ Invalid number.", extras_people_kb())
+        n = 0
+        for p in get_people(OWNER_ID):
+            if p["monthly_interest_rate"] in (None, 0):
+                set_interest_rate(OWNER_ID, p["id"], rate); n += 1
+        await state.clear()
+        await send_text(m.chat.id, f"✅ Applied {rate:.2f}% to {n} people.", extras_people_kb())
+    except Exception as e:
+        await state.clear()
+        await m.answer(f"❌ global interest error: {e}", reply_markup=extras_people_kb())
+
+# ---------- Dev Tools (5) ----------
+DEV_WORKDIR = "/root/mmnd"
+DEV_SERVICE = "expensebot.service"
+DEV_UPDATE_CHAIN = (
+    "cd /root/mmnd"
+    " && git fetch --all --prune"
+    " && git reset --hard origin/main"
+    " && . .venv/bin/activate"
+    " && pip install -U pip wheel"
+    " && [ -f requirements.txt ] && pip install -r requirements.txt || true"
+    " && deactivate"
+    " && systemctl restart expensebot.service"
+    " && journalctl -u expensebot.service -n 40 --no-pager"
+)
+
+def run_cmd(cmd: str, timeout: int=900) -> Tuple[int,str]:
+    try:
+        p = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        return p.returncode, p.stdout
+    except subprocess.TimeoutExpired as e:
+        return 124, (e.stdout or "") + "\n\n[timeout]"
+    except Exception as e:
+        return 1, str(e)
+
+async def send_text_or_file(chat_id: int, text: str, title: str, kb):
+    if len(text) <= 3500:
+        await send_text(chat_id, f"<b>{title}</b>\n<pre>{re.sub(r'<','&lt;', text)}</pre>", kb)
+    else:
+        out_dir = DATA_DIR / f"user_{OWNER_ID}"; out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"{title.lower().replace(' ','_')}_{datetime.now(TZ).strftime('%Y-%m-%d_%H-%M')}.log"
+        path.write_text(text, encoding="utf-8")
+        await send_document(chat_id, path, caption=title, kb=kb)
+
+@router.callback_query(F.data == "dev_update")
+async def dev_update(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
+        rc, out = run_cmd(DEV_UPDATE_CHAIN)
+        await send_text_or_file(c.message.chat.id, out, "Update Output", extras_dev_kb()); await c.answer("Done" if rc==0 else "Error")
+    except Exception as e:
+        await c.message.answer(f"❌ update error: {e}")
+
+@router.callback_query(F.data == "dev_restart")
+async def dev_restart(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        rc, out = run_cmd(f"systemctl restart {DEV_SERVICE} && echo OK || echo FAIL")
+        await send_text(c.message.chat.id, f"🔁 Restart: {'OK' if 'OK' in out else 'FAIL'}", extras_dev_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ restart error: {e}")
+
+@router.callback_query(F.data == "dev_status")
+async def dev_status(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        rc, out = run_cmd(f"systemctl status {DEV_SERVICE} --no-pager -n 0")
+        await send_text_or_file(c.message.chat.id, out, "Service Status", extras_dev_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ status error: {e}")
+
+@router.callback_query(F.data == "dev_logs")
+async def dev_logs(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        rc, out = run_cmd(f"journalctl -u {DEV_SERVICE} -n 80 --no-pager")
+        await send_text_or_file(c.message.chat.id, out, "Recent Logs", extras_dev_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ logs error: {e}")
+
+@router.callback_query(F.data == "dev_gitinfo")
+async def dev_gitinfo(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        cmd = "cd /root/mmnd && git rev-parse --abbrev-ref HEAD && git log -1 --pretty=oneline"
+        rc, out = run_cmd(cmd)
+        await send_text_or_file(c.message.chat.id, out, "Git Info", extras_dev_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ git info error: {e}")
+
+# ------------- Expense Flow (unchanged core, with hard wipes) -------------
 EXP_CATS = ["Food","Travel","Bills","Other","✍️ Custom"]
 
 @router.callback_query(F.data == "add_expense")
@@ -997,7 +1347,7 @@ async def pick_cat(c: CallbackQuery, state: FSMContext):
 async def exp_custom_cat(m: Message, state: FSMContext):
     try:
         if not only_owner(m): return await m.answer(deny_text())
-        cat = m.text.strip()[:30] or "Other"
+        cat = (m.text or "").strip()[:30] or "Other"
         await state.update_data(category=cat)
         await state.set_state(AddExpenseStates.waiting_note)
         await m.answer("📝 Optional note? (or tap Skip)", reply_markup=skip_kb())
@@ -1081,10 +1431,10 @@ async def cb_person_add(c: CallbackQuery, state: FSMContext):
 async def person_add_name(m: Message, state: FSMContext):
     try:
         if not only_owner(m): return await m.answer(deny_text())
-        pid, err = add_person(OWNER_ID, m.text)
+        pid, err = add_person(OWNER_ID, m.text or "")
         await state.clear()
         if err: return await send_text(m.chat.id, f"⚠️ {err}", people_kb(OWNER_ID))
-        await send_text(m.chat.id, f"✅ Added <b>{m.text.strip()}</b>.", people_kb(OWNER_ID))
+        await send_text(m.chat.id, f"✅ Added <b>{(m.text or '').strip()}</b>.", people_kb(OWNER_ID))
     except Exception as e:
         await m.answer(f"❌ person save error: {e}")
 
@@ -1782,8 +2132,7 @@ async def import_guess_aggr(c: CallbackQuery):
             f"🧪 Aggressive parse added {improved} rows.\n"
             f"Ledger now: {len(st['ledger'])}\n"
             f"Issues left: {len(st['issues'])}",
-            import_summary_kb(len(st["issues"])>0))
-        await c.answer()
+            import_summary_kb(len(st["issues"])>0)); await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ aggressive parse error: {e}")
 
@@ -1919,11 +2268,9 @@ def _parse_multi(q: str) -> List[Tuple[str, Any]]:
     Returns list of (intent, arg) in order. Handles multiple 'and'-separated commands.
     """
     s = _norm(q)
-    # remove polite wrappers
     s = re.sub(r"\b(hey|hi|hello|please|pls|buddy|bro|yaar|kindly|can you|could you|would you|do one thing)\b", "", s)
     s = re.sub(r"\s+", " ", s).strip()
 
-    # split on ' and ' to execute sequential actions
     parts = [p.strip() for p in re.split(r"\band\b", s) if p.strip()]
 
     intents: List[Tuple[str,Any]] = []
@@ -2000,7 +2347,6 @@ async def cb_support_ai(c: CallbackQuery, state: FSMContext):
         if not only_owner(c): return await c.message.answer(deny_text())
         await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
         await state.set_state(SupportAIState.waiting_query)
-        # Independent, no main menu attached
         await send_text(
             c.message.chat.id,
             "🧑‍🤝‍🧑 <b>Support</b>\n"
@@ -2047,47 +2393,63 @@ async def handle_support_query(m: Message, state: FSMContext):
                 continue
 
             if intent == "people_list":
-                plist = [p["display_name"] for p in get_people(OWNER_ID)]
-                if not plist:
-                    await send_text(m.chat.id, "No people yet. Use: add person <name> or People → Add.")
-                else:
-                    await send_text(m.chat.id, "👥 " + ", ".join(plist))
+                plist = [p["display_name"] for p in get_people
+            if intent == "people_list":
+                plist = []
+                for p in get_people(OWNER_ID):
+                    bal = person_balance(OWNER_ID, p["id"])
+                    warn = ""
+                    if p["credit_limit"] is not None and bal > float(p["credit_limit"]):
+                        warn = " ⚠️"
+                    plist.append(f"• {p['display_name']} — {CURRENCY}{bal:,.2f}{warn}")
+                text = "👥 People (balance; + they owe you):\n" + ("\n".join(plist) if plist else "No people yet.")
+                explained = await ai_explain(q, text, "People list with their current balances.")
+                await send_text(m.chat.id, explained or text)
                 continue
 
             if intent == "monthly_spend":
-                month = cur_yyyymm(); total = monthly_total(OWNER_ID, month)
-                base = f"🧾 {month} spend: <b>{CURRENCY}{total:,.2f}</b>"
-                extra = await ai_explain(q, base, f"Monthly spend {month} is {total}")
-                await send_text(m.chat.id, extra or base)
+                month = cur_yyyymm()
+                total = monthly_total(OWNER_ID, month)
+                lines = [f"📊 {month} Spend: <b>{CURRENCY}{total:,.2f}</b>"]
+                cats = monthly_by_category(OWNER_ID, month)
+                if cats:
+                    lines.append("\n🏷️ By category:")
+                    for r in cats:
+                        lines.append(f"• {r['cat']}: {CURRENCY}{float(r['s']):,.2f}")
+                text = "\n".join(lines)
+                explained = await ai_explain(q, text, "Monthly spending and category breakdown.")
+                await send_text(m.chat.id, explained or text)
                 continue
 
             if intent == "due_soon":
                 rows = due_items(OWNER_ID, 7)
                 if not rows:
-                    base = "✅ Nothing due in the next 7 days."
+                    text = "✅ Nothing due in the next 7 days."
                 else:
                     parts = ["⏰ <b>Due Soon / Overdue</b>"]
                     for r in rows:
                         when = datetime.fromtimestamp(r["due_ts"], TZ).strftime("%d %b")
                         parts.append(f"• {r['name']}: {CURRENCY}{float(r['amount']):,.2f} — due {when}")
-                    base = "\n".join(parts)
-                await send_text(m.chat.id, base)
+                    text = "\n".join(parts)
+                explained = await ai_explain(q, text, "Upcoming due/overdue lends in 7 days.")
+                await send_text(m.chat.id, explained or text)
                 continue
 
             if intent == "top_balances":
-                tb = top_balances(OWNER_ID, 10)
+                tb = top_balances(OWNER_ID, 20)
                 if not tb:
-                    base = "No outstanding balances."
+                    text = "👏 All clear — no outstanding balances."
                 else:
                     lines = ["👑 <b>Top balances</b>"]
                     for r in tb:
                         lines.append(f"• {r['display_name']}: {CURRENCY}{float(r['bal']):,.2f}")
-                    base = "\n".join(lines)
-                await send_text(m.chat.id, base)
+                    text = "\n".join(lines)
+                explained = await ai_explain(q, text, "People ranked by balance (positive means they owe you).")
+                await send_text(m.chat.id, explained or text)
                 continue
 
             if intent == "add_person":
-                name = arg
+                name = (arg or "").strip()
                 pid, err = add_person(OWNER_ID, name)
                 if err:
                     await send_text(m.chat.id, f"⚠️ {err}")
@@ -2095,595 +2457,140 @@ async def handle_support_query(m: Message, state: FSMContext):
                     await send_text(m.chat.id, f"✅ Added <b>{name}</b>.")
                 continue
 
-            if intent in ("person_summary","balance_person","ledger_person","delete_person"):
-                name = arg
+            if intent == "delete_person":
+                name = (arg or "").strip()
                 pid, disp = resolve_person_id(OWNER_ID, name)
                 if not pid:
-                    await send_text(m.chat.id, f"⚠️ Person “{name}” not found.")
+                    await send_text(m.chat.id, "⚠️ Person not found.")
                     continue
+                delete_person(OWNER_ID, pid)
+                await send_text(m.chat.id, f"🗑 Deleted <b>{disp}</b>.")
+                continue
 
-                if intent == "delete_person":
-                    delete_person(OWNER_ID, pid)
-                    await send_text(m.chat.id, f"🗑 Deleted <b>{disp}</b> and all related data.")
+            if intent == "ledger_person":
+                name = (arg or "").strip()
+                pid, disp = resolve_person_id(OWNER_ID, name)
+                if not pid:
+                    await send_text(m.chat.id, "⚠️ Person not found.")
                     continue
+                rows = get_ledger(OWNER_ID, pid)
+                if not rows:
+                    text = f"🗒 Ledger for <b>{disp}</b> is empty."
+                else:
+                    last = rows[-10:]
+                    lines = [f"🗒 <b>{disp}</b> (last {len(last)} of {len(rows)})"]
+                    for r in last:
+                        dt = datetime.fromtimestamp(r["ts"], TZ).strftime("%d %b %H:%M")
+                        sym = {"lend": "➕", "repay": "➖", "interest": "➕"}[r["type"]]
+                        due = f" ⏰{datetime.fromtimestamp(r['due_ts'], TZ).strftime('%d %b')}" if r["due_ts"] else ""
+                        lines.append(f"{dt} {sym} {CURRENCY}{float(r['amount']):,.2f}{due} — {r['note']}")
+                    bal = person_balance(OWNER_ID, pid)
+                    lines.append(f"\n💼 Balance: <b>{CURRENCY}{bal:,.2f}</b>")
+                    text = "\n".join(lines)
+                explained = await ai_explain(q, text, f"Recent ledger lines for {disp}.")
+                await send_text(m.chat.id, explained or text)
+                continue
 
-                if intent == "ledger_person":
-                    rows = get_ledger(OWNER_ID, pid)
-                    if not rows:
-                        base = f"🗒 Ledger for <b>{disp}</b> is empty."
-                    else:
-                        last = rows[-10:]
-                        lines = []
-                        for r in last:
-                            dt = datetime.fromtimestamp(r["ts"], TZ).strftime("%d %b %H:%M")
-                            sym = {"lend":"➕","repay":"➖","interest":"➕"}[r["type"]]
-                            due = f" ⏰{datetime.fromtimestamp(r['due_ts'], TZ).strftime('%d %b')}" if r["due_ts"] else ""
-                            lines.append(f"{dt} {sym} {CURRENCY}{float(r['amount']):,.2f}{due} — {r['note']}")
-                        bal = person_balance(OWNER_ID, pid)
-                        base = (f"🗒 <b>{disp}</b> (last {len(last)} of {len(rows)})\n" +
-                                "\n".join(lines) +
-                                f"\n\n💼 Balance: <b>{CURRENCY}{bal:,.2f}</b>")
-                    await send_text(m.chat.id, base)
+            if intent == "person_summary":
+                name = (arg or "").strip()
+                pid, disp = resolve_person_id(OWNER_ID, name)
+                if not pid:
+                    await send_text(m.chat.id, "⚠️ Person not found.")
                     continue
-
+                # fetch person info
+                con = db(); cur = con.cursor()
+                cur.execute("SELECT credit_limit, monthly_interest_rate FROM people WHERE user_id=? AND id=?", (OWNER_ID, pid))
+                row = cur.fetchone(); con.close()
                 bal = person_balance(OWNER_ID, pid)
-                rate, _ = get_person_interest_info(OWNER_ID, pid)
-                lim = get_credit_limit(OWNER_ID, pid)
-                due = due_items(OWNER_ID, 30)
-                due_line = ""
-                for r in due:
-                    if r["name"].lower() == disp.lower():
-                        due_line = f"\n⏰ Due soon: {CURRENCY}{float(r['amount']):,.2f} by {datetime.fromtimestamp(r['due_ts'], TZ).strftime('%d %b')}"
-                        break
-                if bal > 0: base = f"📇 <b>{disp}</b>\n• Owes you: <b>{CURRENCY}{bal:,.2f}</b>"
-                elif bal < 0: base = f"📇 <b>{disp}</b>\n• You owe: <b>{CURRENCY}{abs(bal):,.2f}</b>"
-                else: base = f"📇 <b>{disp}</b>\n• Settled (₹0)"
-                base += f"\n• Interest: {(rate or 0):.2f}% / mo\n• Limit: {CURRENCY}{(lim or 0):,.2f}{due_line}"
-                await send_text(m.chat.id, base)
+                limit = row["credit_limit"] if row else None
+                rate = row["monthly_interest_rate"] if row else None
+                warn = " ⚠️ Over limit" if (limit is not None and bal > float(limit)) else ""
+                # recent 3 lines
+                lg = get_ledger(OWNER_ID, pid)
+                lines = [f"👤 <b>{disp}</b>\n💼 Balance: <b>{CURRENCY}{bal:,.2f}</b>{warn}",
+                         f"🎯 Limit: {((''+CURRENCY+f'{limit:,.2f}') if limit is not None else '(not set)')}",
+                         f"💠 Interest: {rate if rate is not None else 0:.2f}% / month"]
+                if lg:
+                    lines.append("\n🧾 Recent:")
+                    for r in lg[-3:]:
+                        dt = datetime.fromtimestamp(r["ts"], TZ).strftime("%d %b")
+                        sym = {"lend": "➕", "repay": "➖", "interest": "➕"}[r["type"]]
+                        due = f" ⏰{datetime.fromtimestamp(r['due_ts'], TZ).strftime('%d %b')}" if r["due_ts"] else ""
+                        lines.append(f"• {dt} {sym} {CURRENCY}{float(r['amount']):,.2f}{due} — {r['note']}")
+                text = "\n".join(lines)
+                explained = await ai_explain(q, text, f"Summary for {disp}.")
+                await send_text(m.chat.id, explained or text)
+                continue
+
+            if intent == "balance_person":
+                name = (arg or "").strip()
+                pid, disp = resolve_person_id(OWNER_ID, name)
+                if not pid:
+                    await send_text(m.chat.id, "⚠️ Person not found.")
+                    continue
+                bal = person_balance(OWNER_ID, pid)
+                text = f"💼 <b>{disp}</b> balance: <b>{CURRENCY}{bal:,.2f}</b> (+ they owe you)"
+                explained = await ai_explain(q, text, f"Balance with {disp}.")
+                await send_text(m.chat.id, explained or text)
                 continue
 
             if intent == "set_limit":
-                name, limv = arg
+                name, amt = arg
                 pid, disp = resolve_person_id(OWNER_ID, name)
                 if not pid:
-                    await send_text(m.chat.id, f"⚠️ Person “{name}” not found.")
-                else:
-                    set_credit_limit(OWNER_ID, pid, limv)
-                    await send_text(m.chat.id, f"🎯 Limit for <b>{disp}</b> set to {CURRENCY}{limv:,.2f}.")
+                    await send_text(m.chat.id, "⚠️ Person not found.")
+                    continue
+                set_credit_limit(OWNER_ID, pid, None if amt <= 0 else amt)
+                await send_text(m.chat.id, f"✅ Limit for <b>{disp}</b> set to {('cleared' if amt <= 0 else f'{CURRENCY}{amt:,.2f}')} .")
                 continue
 
             if intent == "set_interest":
                 name, rate = arg
                 pid, disp = resolve_person_id(OWNER_ID, name)
                 if not pid:
-                    await send_text(m.chat.id, f"⚠️ Person “{name}” not found.")
-                else:
-                    set_interest_rate(OWNER_ID, pid, rate)
-                    await send_text(m.chat.id, f"💠 Interest for <b>{disp}</b> set to {rate:.2f}% / month.")
+                    await send_text(m.chat.id, "⚠️ Person not found.")
+                    continue
+                set_interest_rate(OWNER_ID, pid, None if rate == 0 else rate)
+                await send_text(m.chat.id, f"✅ Interest for <b>{disp}</b> set to {rate:.2f}% / month.")
                 continue
 
             if intent == "lend_to":
-                amt, name, due_text = arg
+                amt, name, due = arg
                 pid, disp = resolve_person_id(OWNER_ID, name)
                 if not pid:
-                    await send_text(m.chat.id, f"⚠️ Person “{name}” not found.")
-                else:
-                    due_ts = None
-                    if due_text:
-                        d = parse_date_fuzzy(due_text)
-                        if d: due_ts = int(d.replace(hour=23, minute=59).timestamp())
-                    lid = add_ledger(OWNER_ID, pid, "lend", amt, "via Support", due_ts)
-                    log_action(OWNER_ID, "ledger", "ledger", lid)
-                    bal = person_balance(OWNER_ID, pid)
-                    await send_text(m.chat.id, f"✅ Lend {CURRENCY}{amt:,.2f} to <b>{disp}</b>\n💼 Balance: {CURRENCY}{bal:,.2f}")
+                    pid, _ = add_person(OWNER_ID, name)
+                    disp = name
+                due_ts = None
+                if due:
+                    d = parse_date_fuzzy(due)
+                    if d:
+                        due_ts = int(d.replace(hour=23, minute=59).timestamp())
+                lid = add_ledger(OWNER_ID, pid, "lend", float(amt), None, due_ts)
+                log_action(OWNER_ID, "ledger", "ledger", lid)
+                bal = person_balance(OWNER_ID, pid)
+                limit = get_credit_limit(OWNER_ID, pid)
+                warn = f"\n⚠️ <b>Over limit</b> (limit {CURRENCY}{limit:,.2f})" if (limit is not None and bal > float(limit)) else ""
+                dd = "" if not due_ts else "\n⏰ Due " + datetime.fromtimestamp(due_ts, TZ).strftime("%d %b")
+                await send_text(m.chat.id, f"✅ Lend saved to <b>{disp}</b>: {CURRENCY}{float(amt):,.2f}{dd}\n💼 New balance: {CURRENCY}{bal:,.2f}{warn}")
                 continue
 
             if intent == "repay_from":
                 amt, name = arg
                 pid, disp = resolve_person_id(OWNER_ID, name)
                 if not pid:
-                    await send_text(m.chat.id, f"⚠️ Person “{name}” not found.")
-                else:
-                    lid = add_ledger(OWNER_ID, pid, "repay", amt, "via Support")
-                    log_action(OWNER_ID, "ledger", "ledger", lid)
-                    bal = person_balance(OWNER_ID, pid)
-                    await send_text(m.chat.id, f"✅ Repay {CURRENCY}{amt:,.2f} from <b>{disp}</b>\n💼 Balance: {CURRENCY}{bal:,.2f}")
+                    await send_text(m.chat.id, "⚠️ Person not found.")
+                    continue
+                lid = add_ledger(OWNER_ID, pid, "repay", float(amt), None)
+                log_action(OWNER_ID, "ledger", "ledger", lid)
+                bal = person_balance(OWNER_ID, pid)
+                await send_text(m.chat.id, f"✅ Repay from <b>{disp}</b>: {CURRENCY}{float(amt):,.2f}\n💼 New balance: {CURRENCY}{bal:,.2f}")
                 continue
 
+            # Fallback (shouldn't usually hit because _parse_multi covers a lot)
+            await send_text(m.chat.id, "🤔 I didn’t understand that part.")
+
+        # once all intents processed, exit Support state
         await state.clear()
     except Exception as e:
         await state.clear()
         await m.answer(f"❌ support error: {e}")
-
-# Quick-add free text (outside Support)
-NAME_SIGN_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9 ._-]{2,})\s+(?P<sign>[+-])\s*(?P<amt>\d+(?:\.\d{1,2})?)\s*(?P<note>.+)?$")
-QUICK_RE = re.compile(r"^\s*(\d+(?:\.\d{1,2})?)\s*>\s*(add\s*to|lend\s*to|repay|repay\s*from|repay\s*to)\s*>\s*(.+)$", re.IGNORECASE)
-VERBAL_RE_1 = re.compile(r"lend\s+(?P<amt>\d+(?:\.\d{1,2})?)\s+(?:to\s+)?(?P<name>[A-Za-z0-9 ._-]{2,})(?:\s+(?P<note>.+))?", re.IGNORECASE)
-VERBAL_RE_2 = re.compile(r"(?:repay|returned?)\s+(?P<amt>\d+(?:\.\d{1,2})?)\s+(?:from|by)?\s*(?P<name>[A-Za-z0-9 ._-]{2,})(?:\s+(?P<note>.+))?", re.IGNORECASE)
-
-@router.message()
-async def catch_all(m: Message):
-    try:
-        if not only_owner(m): return await m.answer(deny_text())
-        txt = (m.text or "").strip()
-        if not txt: return
-
-        mm2 = NAME_SIGN_RE.match(txt)
-        if mm2:
-            name = mm2.group("name").strip()
-            sign = mm2.group("sign")
-            amt = float(mm2.group("amt"))
-            note = (mm2.group("note") or "").strip() or "quick-add"
-            pid, disp = resolve_person_id(OWNER_ID, name)
-            if not pid:
-                return await m.answer("⚠️ Person not found. Add via 👥 People → ➕ Add Person.")
-            if sign == "+":
-                lid = add_ledger(OWNER_ID, pid, "lend", amt, note)
-            else:
-                lid = add_ledger(OWNER_ID, pid, "repay", amt, note)
-            log_action(OWNER_ID, "ledger", "ledger", lid)
-            bal = person_balance(OWNER_ID, pid)
-            return await send_text(m.chat.id, f"✅ {'Lend' if sign=='+' else 'Repay'} {CURRENCY}{amt:,.2f} {'to' if sign=='+' else 'from'} <b>{disp}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}", people_kb(OWNER_ID))
-
-        mm = QUICK_RE.match(txt)
-        if mm:
-            amount = float(mm.group(1))
-            action = mm.group(2).lower().replace(" ", "")
-            name = mm.group(3).strip()
-            pid, disp = resolve_person_id(OWNER_ID, name)
-            if not pid:
-                return await m.answer("⚠️ Person not found. Add via 👥 People → ➕ Add Person.")
-            if "addto" in action or "lendto" in action:
-                lid = add_ledger(OWNER_ID, pid, "lend", amount, "quick-add")
-            else:
-                lid = add_ledger(OWNER_ID, pid, "repay", amount, "quick-add")
-            log_action(OWNER_ID, "ledger", "ledger", lid)
-            bal = person_balance(OWNER_ID, pid)
-            return await send_text(m.chat.id, f"✅ {'Lend' if 'addto' in action or 'lendto' in action else 'Repay'} {CURRENCY}{amount:,.2f} {'to' if 'lend' in action else 'from'} <b>{disp}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}", people_kb(OWNER_ID))
-
-        mm3 = VERBAL_RE_1.match(txt)  # lend X to Name
-        mm4 = VERBAL_RE_2.match(txt)  # repay X from Name
-        if mm3 or mm4:
-            lend_mode = bool(mm3)
-            g = mm3 if mm3 else mm4
-            amount = float(g.group("amt"))
-            name = g.group("name").strip()
-            note = (g.group("note") or "quick-add").strip()
-            pid, disp = resolve_person_id(OWNER_ID, name)
-            if not pid:
-                return await m.answer("⚠️ Person not found. Add via 👥 People → ➕ Add Person.")
-            lid = add_ledger(OWNER_ID, pid, "lend" if lend_mode else "repay", amount, note)
-            log_action(OWNER_ID, "ledger", "ledger", lid)
-            bal = person_balance(OWNER_ID, pid)
-            return await send_text(m.chat.id, f"✅ {'Lend' if lend_mode else 'Repay'} {CURRENCY}{amount:,.2f} {'to' if lend_mode else 'from'} <b>{disp}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}", people_kb(OWNER_ID))
-
-        await send_text(m.chat.id, "Use the buttons below 👇", main_kb())
-    except Exception as e:
-        await m.answer(f"❌ handler error: {e}", reply_markup=main_kb())
-
-# ---------- Background: reminders + monthly interest ----------
-async def send_daily_summary():
-    month = cur_yyyymm(); total = monthly_total(OWNER_ID, month)
-    tb = top_balances(OWNER_ID, 10)
-    lines = [f"📬 <b>Daily Summary</b> ({datetime.now(TZ).strftime('%Y-%m-%d')})",
-             f"🧾 {month} spend: <b>{CURRENCY}{total:,.2f}</b>"]
-    due = due_items(OWNER_ID, 7)
-    if due:
-        lines.append("\n⏰ Due Soon / Overdue (7d):")
-        for r in due[:10]:
-            when = datetime.fromtimestamp(r["due_ts"], TZ).strftime("%d %b")
-            lines.append(f"• {r['name']}: {CURRENCY}{float(r['amount']):,.2f} — due {when}")
-    if tb:
-        lines.append("\n👥 Top balances:")
-        for r in tb[:10]:
-            lines.append(f"• {r['display_name']}: {CURRENCY}{float(r['bal']):,.2f}")
-    try:
-        msg = await bot.send_message(OWNER_ID, "\n".join(lines))
-        record_bot_message(OWNER_ID, OWNER_ID, msg.message_id)
-    except Exception:
-        pass
-
-async def send_weekly_digest():
-    month = cur_yyyymm(); total = monthly_total(OWNER_ID, month)
-    tb = top_balances(OWNER_ID, 20)
-    lines = [f"🗞️ <b>Weekly Digest</b> (week of {datetime.now(TZ).strftime('%Y-%m-%d')})",
-             f"🧾 {month} spend so far: <b>{CURRENCY}{total:,.2f}</b>",
-             "👥 Balances (top 20):"]
-    for r in tb:
-        lines.append(f"• {r['display_name']}: {CURRENCY}{float(r['bal']):,.2f}")
-    try:
-        msg = await bot.send_message(OWNER_ID, "\n".join(lines))
-        record_bot_message(OWNER_ID, OWNER_ID, msg.message_id)
-    except Exception:
-        pass
-
-async def apply_monthly_interest():
-    yyyymm = cur_yyyymm()
-    for p in get_people(OWNER_ID):
-        rate = p["monthly_interest_rate"]
-        if not rate or rate <= 0: continue
-        if p["last_interest_yyyymm"] == yyyymm: continue
-        bal = person_balance(OWNER_ID, p["id"])
-        if bal > 0:
-            interest_amt = round(bal * (rate/100.0), 2)
-            if interest_amt > 0:
-                lid = add_ledger(OWNER_ID, p["id"], "interest", interest_amt, f"monthly interest {rate:.2f}%")
-                log_action(OWNER_ID, "ledger", "ledger", lid)
-        update_last_interest_applied(OWNER_ID, p["id"], yyyymm)
-
-async def scheduler_loop():
-    while True:
-        try:
-            await apply_monthly_interest()
-            s = get_settings(OWNER_ID)
-            now = datetime.now(TZ)
-            if s["daily_reminders"]:
-                today = now.strftime("%Y-%m-%d")
-                if s["last_daily_date"] != today and now.hour >= int(s["daily_hour"]):
-                    await send_daily_summary(); set_setting(OWNER_ID, "last_daily_date", today)
-            if s["weekly_reminders"]:
-                week_key = f"{now.year}-W{now.isocalendar().week}"
-                if now.weekday() == int(s["weekly_dow"]) and now.hour >= 10 and s["last_weekly_date"] != week_key:
-                    await send_weekly_digest(); set_setting(OWNER_ID, "last_weekly_date", week_key)
-        except Exception:
-            pass
-        await asyncio.sleep(60)
-
-# ---------- EXTRAS (20 features) ----------
-
-async def run_shell(cmd: str) -> str:
-    """Run shell command and return combined output (trimmed)."""
-    proc = await asyncio.create_subprocess_shell(
-        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-    out, _ = await proc.communicate()
-    text = (out or b"").decode(errors="ignore")
-    # trim to Telegram safe length
-    if len(text) > 3500:
-        text = text[-3500:]
-    return text.strip() or "(no output)"
-
-@router.callback_query(F.data == "dev_update")
-async def dev_update(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
-        # Pull + install deps in existing venv (no restart here)
-        cmd = (
-            "cd /root/mmnd "
-            "&& git fetch --all --prune "
-            "&& git reset --hard origin/main "
-            "&& . .venv/bin/activate "
-            "&& pip install -U pip wheel "
-            "&& [ -f requirements.txt ] && pip install -r requirements.txt || true "
-            "&& deactivate"
-        )
-        await send_text(c.message.chat.id, "🔄 Updating code…")
-        out = await run_shell(cmd)
-        kb = InlineKeyboardBuilder()
-        kb.button(text="♻️ Restart Service", callback_data="dev_restart")
-        kb.button(text="📜 Tail Logs", callback_data="dev_logs")
-        kb.button(text="⬅️ Back", callback_data="extras")
-        kb.adjust(2,1)
-        await send_text(c.message.chat.id, f"<b>Update result</b>\n<code>{out}</code>", kb.as_markup())
-        await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ update error: {e}")
-
-@router.callback_query(F.data == "dev_restart")
-async def dev_restart(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        # schedule restart in background so we can send ack
-        await run_shell("nohup bash -lc 'sleep 1; systemctl restart expensebot.service' >/dev/null 2>&1 &")
-        await send_text(c.message.chat.id, "♻️ Restart scheduled. Use “📜 Tail Logs” after it comes back.", extras_kb())
-        await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ restart error: {e}")
-
-@router.callback_query(F.data == "dev_logs")
-async def dev_logs(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        out = await run_shell("journalctl -u expensebot.service -n 60 --no-pager")
-        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
-        await send_text(c.message.chat.id, f"<b>Last 60 lines</b>\n<code>{out}</code>", extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ logs error: {e}")
-
-@router.callback_query(F.data == "dev_health")
-async def dev_health(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        st = get_settings(OWNER_ID)
-        db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
-        total, used, free = shutil.disk_usage("/")
-        lines = [
-            "🩺 <b>Health</b>",
-            f"Python: {platform.python_version()}",
-            f"Aiogram: {__import__('aiogram').__version__}",
-            f"DB: {DB_PATH} ({db_size/1024/1024:.2f} MB)",
-            f"Disk free: {free/1024/1024/1024:.2f} GB",
-            f"Delete user msgs: {'ON' if get_delete_user_msgs(OWNER_ID) else 'OFF'}",
-            f"Keep-Last UI: {get_keep_last(OWNER_ID)}",
-            f"Daily@{st['daily_hour']:02d} {'ON' if st['daily_reminders'] else 'OFF'}; "
-            f"Weekly DOW {st['weekly_dow']} {'ON' if st['weekly_reminders'] else 'OFF'}",
-        ]
-        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
-        await send_text(c.message.chat.id, "\n".join(lines), extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ health error: {e}")
-
-@router.callback_query(F.data == "purge_ui")
-async def purge_ui(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        await delete_old_bot_messages(c.message.chat.id, keep_last=0)
-        await send_text(c.message.chat.id, "🧹 Purged all prior UI.", extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ purge error: {e}")
-
-@router.callback_query(F.data == "interest_now")
-async def interest_now(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        await apply_monthly_interest()
-        await send_text(c.message.chat.id, "💠 Applied monthly interest for current month (where applicable).", extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ interest error: {e}")
-
-@router.callback_query(F.data == "send_daily")
-async def send_daily_now(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        await send_daily_summary()
-        await send_text(c.message.chat.id, "📬 Daily summary sent to you.", extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ daily error: {e}")
-
-@router.callback_query(F.data == "send_weekly")
-async def send_weekly_now(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        await send_weekly_digest()
-        await send_text(c.message.chat.id, "🗞 Weekly digest sent to you.", extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ weekly error: {e}")
-
-@router.callback_query(F.data == "export_people")
-async def extra_export_people(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        p = export_people_summary_csv(OWNER_ID)
-        await send_document(c.message.chat.id, p, caption="📑 People Summary CSV", kb=extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ export people error: {e}")
-
-@router.callback_query(F.data == "export_month_csv")
-async def extra_export_month(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        p = export_expenses_month_csv(OWNER_ID, cur_yyyymm())
-        await send_document(c.message.chat.id, p, caption=f"🧾 Expenses {cur_yyyymm()}", kb=extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ export month error: {e}")
-
-@router.callback_query(F.data == "export_dues_csv")
-async def extra_export_dues(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        p = export_dues_csv(OWNER_ID, 30)
-        await send_document(c.message.chat.id, p, caption="⏰ Dues (next 30 days)", kb=extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ export dues error: {e}")
-
-@router.callback_query(F.data == "backup_db")
-async def backup_db(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        out_dir = DATA_DIR / f"user_{OWNER_ID}"; out_dir.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now(TZ).strftime("%Y-%m-%d_%H-%M")
-        bpath = out_dir / f"db_backup_{ts}.sqlite"
-        if DB_PATH.exists():
-            shutil.copy2(DB_PATH, bpath)
-            await send_document(c.message.chat.id, bpath, caption="💾 DB backup", kb=extras_kb())
-        else:
-            await send_text(c.message.chat.id, "DB file not found.", extras_kb())
-        await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ backup error: {e}")
-
-@router.callback_query(F.data == "restore_db")
-async def restore_db_prompt(c: CallbackQuery, state: FSMContext):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        await state.set_state(RestoreDBState.waiting_db)
-        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
-        await send_text(c.message.chat.id, "♻️ Send the <b>.sqlite/.db</b> file to restore. I will replace current DB."); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ restore prompt error: {e}")
-
-@router.message(RestoreDBState.waiting_db, F.document)
-async def restore_db_handle(m: Message, state: FSMContext):
-    try:
-        if not only_owner(m): return await m.answer(deny_text())
-        fname = (m.document.file_name or "").lower()
-        if not (fname.endswith(".sqlite") or fname.endswith(".db")):
-            return await m.answer("⚠️ Please send a .sqlite or .db file.")
-        tmp = Path("imports") / f"restore_{int(time.time())}.sqlite"
-        tmp.parent.mkdir(exist_ok=True)
-        await _download_document(m.document, tmp)
-        # replace DB atomically
-        if DB_PATH.exists():
-            shutil.copy2(DB_PATH, DB_PATH.with_suffix(".bak"))
-        os.replace(tmp, DB_PATH)
-        await state.clear()
-        await send_text(m.chat.id, "✅ Restored DB. You may /start again if needed.", extras_kb())
-    except Exception as e:
-        await m.answer(f"❌ restore error: {e}")
-
-@router.callback_query(F.data == "optimize_db")
-async def optimize_db(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        con = db(); cur = con.cursor()
-        cur.execute("VACUUM"); con.commit(); con.close()
-        await send_text(c.message.chat.id, "🧰 VACUUM complete.", extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ vacuum error: {e}")
-
-@router.callback_query(F.data == "trend6")
-async def trend6(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        png = render_monthly_trend_png(OWNER_ID, 6)
-        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
-        if not png:
-            return await send_text(c.message.chat.id, "ℹ️ No data or chart engine unavailable.", extras_kb())
-        await send_photo(c.message.chat.id, png, "trend6.png", "📈 Monthly Spend (last 6 months)", extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ trend error: {e}")
-
-@router.callback_query(F.data == "search_person")
-async def search_person_prompt(c: CallbackQuery, state: FSMContext):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        await state.set_state(SearchPersonState.waiting_query)
-        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
-        await send_text(c.message.chat.id, "🔎 Type part of the name to search:"); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ search prompt error: {e}")
-
-@router.message(SearchPersonState.waiting_query)
-async def search_person_do(m: Message, state: FSMContext):
-    try:
-        if not only_owner(m): return await m.answer(deny_text())
-        q = canonical(m.text)
-        hits = []
-        for p in get_people(OWNER_ID):
-            if q in canonical(p["display_name"]):
-                bal = person_balance(OWNER_ID, p["id"])
-                hits.append(f"• {p['display_name']} — {CURRENCY}{bal:,.2f}")
-        await state.clear()
-        if not hits:
-            await send_text(m.chat.id, "No matches.", extras_kb())
-        else:
-            await send_text(m.chat.id, "Results:\n" + "\n".join(hits), extras_kb())
-    except Exception as e:
-        await m.answer(f"❌ search error: {e}")
-
-@router.callback_query(F.data == "dup_check")
-async def dup_check(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        names = [p["display_name"] for p in get_people(OWNER_ID)]
-        pairs = []
-        for i in range(len(names)):
-            for j in range(i+1, len(names)):
-                r = difflib.SequenceMatcher(None, names[i].lower(), names[j].lower()).ratio()
-                if r >= 0.85:
-                    pairs.append(f"• {names[i]} ↔ {names[j]} ({r*100:.0f}%)")
-        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
-        if not pairs:
-            await send_text(c.message.chat.id, "✅ No likely duplicates.", extras_kb())
-        else:
-            await send_text(c.message.chat.id, "👥 Possible duplicates:\n" + "\n".join(pairs), extras_kb())
-        await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ dup error: {e}")
-
-@router.callback_query(F.data == "toggle_del_user")
-async def toggle_del_user(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        cur = get_delete_user_msgs(OWNER_ID)
-        set_setting(OWNER_ID, "delete_user_msgs", 0 if cur else 1)
-        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
-        await send_text(c.message.chat.id, f"🧽 Delete user messages: {'ON' if not cur else 'OFF'}", extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ toggle del error: {e}")
-
-@router.callback_query(F.data == "set_keep_last")
-async def set_keep_last_prompt(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        kb = InlineKeyboardBuilder()
-        for n in [0,1,2,3]:
-            kb.button(text=str(n), callback_data=f"keep_last:{n}")
-        kb.button(text="⬅️ Extras", callback_data="extras")
-        kb.adjust(4,1)
-        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
-        await send_text(c.message.chat.id, "How many latest UI messages to keep?", kb.as_markup()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ keep last ui error: {e}")
-
-@router.callback_query(F.data.startswith("keep_last:"))
-async def set_keep_last_do(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        n = int(c.data.split(":")[1])
-        set_setting(OWNER_ID, "keep_last_bot_msgs", n)
-        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
-        await send_text(c.message.chat.id, f"✅ Keep-Last set to {n}.", extras_kb()); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ keep last set error: {e}")
-
-@router.callback_query(F.data == "set_currency")
-async def set_currency_prompt(c: CallbackQuery, state: FSMContext):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        await state.set_state(CurrencyState.waiting_symbol)
-        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
-        await send_text(c.message.chat.id, "💱 Send currency symbol (e.g., ₹, $, €, INR, etc. up to 3 chars):"); await c.answer()
-    except Exception as e:
-        await c.message.answer(f"❌ set currency prompt error: {e}")
-
-@router.message(CurrencyState.waiting_symbol)
-async def set_currency_do(m: Message, state: FSMContext):
-    try:
-        if not only_owner(m): return await m.answer(deny_text())
-        sym = (m.text or "").strip()[:3] or "₹"
-        set_currency(OWNER_ID, sym)
-        await state.clear()
-        await send_text(m.chat.id, f"✅ Currency set to {sym}.", extras_kb())
-    except Exception as e:
-        await m.answer(f"❌ set currency error: {e}")
-
-@router.callback_query(F.data == "lock_now")
-async def lock_now(c: CallbackQuery):
-    try:
-        if not only_owner(c): return await c.message.answer(deny_text())
-        if BOT_PIN:
-            UNLOCKED.discard(OWNER_ID)
-            await wipe_ui(c.message.chat.id, c.message, keep_last=0)
-            await send_text(c.message.chat.id, "🔒 Locked. Send PIN again to unlock.", main_kb()); await c.answer()
-        else:
-            await c.message.answer("No PIN configured (BOT_PIN).")
-    except Exception as e:
-        await c.message.answer(f"❌ lock error: {e}")
-
-# Startup/shutdown
-@dp.startup.register
-async def on_startup():
-    migrate_defaults()
-    global SCHED_TASK
-    try:
-        SCHED_TASK = asyncio.create_task(scheduler_loop())
-    except Exception:
-        SCHED_TASK = None
-
-@dp.shutdown.register
-async def on_shutdown():
-    global SCHED_TASK
-    if SCHED_TASK:
-        SCHED_TASK.cancel()
-        try:
-            await SCHED_TASK
-        except asyncio.CancelledError:
-            pass
-
-# ---------- Main ----------
-if __name__ == "__main__":
-    try:
-        asyncio.run(dp.start_polling(bot))
-    except (KeyboardInterrupt, SystemExit):
-        pass
