@@ -8,6 +8,9 @@ import time
 import json
 import zipfile
 import difflib
+import asyncio
+import platform
+import shutil
 from io import BytesIO
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -17,9 +20,8 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import sqlite3
 
-from aiogram import Bot, Dispatcher, Router, F
+from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, CallbackQuery, FSInputFile, BufferedInputFile, Document
 )
@@ -66,7 +68,7 @@ DB_PATH = Path(os.getenv("DB_PATH") or "data/bot.db")
 DATA_DIR = Path(os.getenv("DATA_DIR") or "exports")
 BOT_PIN = os.getenv("BOT_PIN")  # optional
 
-KEEP_LAST_BOT_MSGS = int(os.getenv("KEEP_LAST_BOT_MSGS") or "1")  # keep newest N messages
+KEEP_LAST_BOT_MSGS_DEFAULT = int(os.getenv("KEEP_LAST_BOT_MSGS") or "1")  # default fallback
 
 # Reminders (defaults)
 DAILY_REMINDERS = int(os.getenv("DAILY_REMINDERS") or "1")
@@ -75,7 +77,7 @@ DAILY_HOUR = int(os.getenv("DAILY_HOUR") or "9")
 WEEKLY_DOW = int(os.getenv("WEEKLY_DOW") or "1")  # 0=Mon
 
 TZ = ZoneInfo("Asia/Kolkata")
-CURRENCY = "₹"
+CURRENCY = os.getenv("CURRENCY") or "₹"  # mutable via Extras
 
 assert BOT_TOKEN, "BOT_TOKEN env is required"
 assert OWNER_ID, "OWNER_ID env is required"
@@ -152,7 +154,43 @@ def init_db():
     )""")
     con.commit(); con.close()
 
+def migrate_settings_extras():
+    """Add new settings columns if missing (idempotent)."""
+    con = db(); cur = con.cursor()
+    cur.execute("PRAGMA table_info(settings)")
+    cols = {r["name"] for r in cur.fetchall()}
+
+    to_add = []
+    if "delete_user_msgs" not in cols:
+        to_add.append(("ALTER TABLE settings ADD COLUMN delete_user_msgs INTEGER DEFAULT 1",))
+    if "keep_last_bot_msgs" not in cols:
+        to_add.append(("ALTER TABLE settings ADD COLUMN keep_last_bot_msgs INTEGER DEFAULT ?", (KEEP_LAST_BOT_MSGS_DEFAULT,)))
+    if "currency" not in cols:
+        to_add.append(("ALTER TABLE settings ADD COLUMN currency TEXT",))
+
+    for stmt in to_add:
+        if len(stmt) == 1:
+            cur.execute(stmt[0])
+        else:
+            cur.execute(stmt[0], stmt[1])
+    con.commit()
+
+    # Ensure row for OWNER_ID exists & defaults applied
+    cur.execute("SELECT 1 FROM settings WHERE user_id=?", (OWNER_ID,))
+    if not cur.fetchone():
+        cur.execute("""INSERT INTO settings (user_id, daily_reminders, weekly_reminders, daily_hour, weekly_dow,
+                    delete_user_msgs, keep_last_bot_msgs, currency)
+                    VALUES (?,?,?,?,?,?,?,?)""",
+                    (OWNER_ID, DAILY_REMINDERS, WEEKLY_REMINDERS, DAILY_HOUR, WEEKLY_DOW, 1, KEEP_LAST_BOT_MSGS_DEFAULT, CURRENCY))
+    else:
+        # backfill nulls
+        cur.execute("UPDATE settings SET delete_user_msgs=COALESCE(delete_user_msgs,1) WHERE user_id=?", (OWNER_ID,))
+        cur.execute("UPDATE settings SET keep_last_bot_msgs=COALESCE(keep_last_bot_msgs,?) WHERE user_id=?", (KEEP_LAST_BOT_MSGS_DEFAULT, OWNER_ID))
+        cur.execute("UPDATE settings SET currency=COALESCE(currency,?) WHERE user_id=?", (CURRENCY, OWNER_ID))
+    con.commit(); con.close()
+
 def migrate_defaults():
+    init_db()
     con = db(); cur = con.cursor()
     cur.execute("SELECT 1 FROM settings WHERE user_id=?", (OWNER_ID,))
     if not cur.fetchone():
@@ -161,6 +199,12 @@ def migrate_defaults():
                     (OWNER_ID, DAILY_REMINDERS, WEEKLY_REMINDERS, DAILY_HOUR, WEEKLY_DOW))
         con.commit()
     con.close()
+    migrate_settings_extras()
+    # sync currency global from DB
+    s = get_settings(OWNER_ID)
+    global CURRENCY
+    if s and s["currency"]:
+        CURRENCY = s["currency"]
 
 # ---------- Utils ----------
 def now_ts() -> int:
@@ -196,6 +240,32 @@ def parse_date_fuzzy(s: str) -> Optional[datetime]:
 
 def canonical(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", (s or "").lower())).strip()
+
+# settings helpers
+def get_settings(user_id: int) -> sqlite3.Row:
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT * FROM settings WHERE user_id=?", (user_id,))
+    row = cur.fetchone(); con.close(); return row
+
+def set_setting(user_id: int, field: str, value):
+    con = db(); cur = con.cursor()
+    cur.execute(f"UPDATE settings SET {field}=? WHERE user_id=?", (value, user_id))
+    con.commit(); con.close()
+
+def get_keep_last(user_id: int) -> int:
+    s = get_settings(user_id)
+    if not s: return KEEP_LAST_BOT_MSGS_DEFAULT
+    return int(s["keep_last_bot_msgs"] if s["keep_last_bot_msgs"] is not None else KEEP_LAST_BOT_MSGS_DEFAULT)
+
+def get_delete_user_msgs(user_id: int) -> bool:
+    s = get_settings(user_id)
+    return bool(s["delete_user_msgs"] if s and s["delete_user_msgs"] is not None else 1)
+
+def set_currency(user_id: int, symbol: str):
+    symbol = (symbol or "₹").strip()[:3]
+    set_setting(user_id, "currency", symbol)
+    global CURRENCY
+    CURRENCY = symbol
 
 # ---------- Data ops ----------
 def add_expense(user_id: int, amount: float, note: Optional[str], category: Optional[str]) -> int:
@@ -322,8 +392,7 @@ def get_person_interest_info(user_id: int, person_id: int) -> Tuple[Optional[flo
 
 def update_last_interest_applied(user_id: int, person_id: int, yyyymm: str):
     con = db(); cur = con.cursor()
-    cur.execute("UPDATE people SET last_interest_yyyymm=? WHERE user_id=? AND id=?",
-                (yyyymm, user_id, person_id))
+    cur.execute("UPDATE people SET last_interest_yyyymm=? WHERE user_id=? AND id=?", (yyyymm, user_id, person_id))
     con.commit(); con.close()
 
 def top_balances(user_id: int, limit: int=5) -> List[sqlite3.Row]:
@@ -372,17 +441,6 @@ def undo_last(user_id: int) -> str:
     con.commit(); con.close()
     return f"Undid last {kind}."
 
-# Settings
-def get_settings(user_id: int) -> sqlite3.Row:
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT * FROM settings WHERE user_id=?", (user_id,))
-    row = cur.fetchone(); con.close(); return row
-
-def set_setting(user_id: int, field: str, value):
-    con = db(); cur = con.cursor()
-    cur.execute(f"UPDATE settings SET {field}=? WHERE user_id=?", (value, user_id))
-    con.commit(); con.close()
-
 # Bot message log
 def record_bot_message(user_id: int, chat_id: int, msg_id: int):
     con = db(); cur = con.cursor()
@@ -395,7 +453,6 @@ def record_bot_message(user_id: int, chat_id: int, msg_id: int):
 async def delete_old_bot_messages(chat_id: int, keep_last: int=0):
     """
     Deletes older bot messages in this chat, keeping the newest `keep_last`.
-    (Fix) We no longer purge kept rows from DB so cleanup keeps working reliably.
     """
     con = db(); cur = con.cursor()
     cur.execute("SELECT id, msg_id FROM bot_msgs WHERE user_id=? AND chat_id=? ORDER BY id DESC", (OWNER_ID, chat_id))
@@ -427,7 +484,6 @@ async def delete_old_bot_messages(chat_id: int, keep_last: int=0):
 async def wipe_ui(chat_id: int, source_message: Optional[Message]=None, keep_last:int=0):
     """
     Deletes the tapped message (old menu) immediately and wipes previous bot UI.
-    Note: Telegram can only delete bot's own messages (not user's).
     """
     if source_message:
         try:
@@ -475,6 +531,50 @@ def export_expenses_csv(user_id: int) -> Path:
         w.writerow([f"THIS MONTH ({this_month})", "", monthly_total(user_id, this_month), "", ""])
     return fpath
 
+def export_expenses_month_csv(user_id: int, yyyymm: Optional[str]=None) -> Path:
+    yyyymm = yyyymm or cur_yyyymm()
+    con = db(); cur = con.cursor()
+    cur.execute("""SELECT ts, amount, COALESCE(note,''), COALESCE(category,'Other')
+                   FROM expenses WHERE user_id=? AND yyyymm=? ORDER BY ts ASC""", (user_id, yyyymm))
+    rows = cur.fetchall(); con.close()
+    out_dir = DATA_DIR / f"user_{user_id}"; out_dir.mkdir(parents=True, exist_ok=True)
+    ts_str = datetime.now(TZ).strftime("%Y-%m-%d_%H-%M")
+    fpath = out_dir / f"expenses_{yyyymm}_{ts_str}.csv"
+    with open(fpath, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["DateTime(IST)","Amount","Note","Category"])
+        for r in rows:
+            dt = datetime.fromtimestamp(r["ts"], TZ).strftime("%Y-%m-%d %H:%M")
+            w.writerow([dt, float(r["amount"]), r[2], r[3]])
+        w.writerow([]); w.writerow(["TOTAL", monthly_total(user_id, yyyymm), "", ""])
+    return fpath
+
+def export_dues_csv(user_id: int, days:int=30) -> Path:
+    rows = due_items(user_id, days)
+    out_dir = DATA_DIR / f"user_{user_id}"; out_dir.mkdir(parents=True, exist_ok=True)
+    ts_str = datetime.now(TZ).strftime("%Y-%m-%d_%H-%M")
+    fpath = out_dir / f"dues_{days}d_{ts_str}.csv"
+    with open(fpath, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Name","Amount","DueDate"])
+        for r in rows:
+            when = datetime.fromtimestamp(r["due_ts"], TZ).strftime("%Y-%m-%d")
+            w.writerow([r["name"], float(r["amount"]), when])
+    return fpath
+
+def export_people_summary_csv(user_id: int) -> Path:
+    people = get_people(user_id)
+    out_dir = DATA_DIR / f"user_{user_id}"; out_dir.mkdir(parents=True, exist_ok=True)
+    ts_str = datetime.now(TZ).strftime("%Y-%m-%d_%H-%M")
+    fpath = out_dir / f"people_summary_{ts_str}.csv"
+    with open(fpath, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["Name","Balance","CreditLimit","MonthlyInterest%"])
+        for p in people:
+            bal = person_balance(user_id, p["id"])
+            w.writerow([p["display_name"], bal, p["credit_limit"] or "", p["monthly_interest_rate"] or ""])
+    return fpath
+
 def export_all_zip(user_id: int) -> Path:
     out_dir = DATA_DIR / f"user_{user_id}"; out_dir.mkdir(parents=True, exist_ok=True)
     ts_str = datetime.now(TZ).strftime("%Y-%m-%d_%H-%M")
@@ -511,6 +611,35 @@ def render_category_chart_png(user_id: int, yyyymm: Optional[str]=None) -> Optio
     buf = BytesIO(); fig.tight_layout(); fig.savefig(buf, format="png"); plt.close(fig)
     return buf.getvalue()
 
+def render_monthly_trend_png(user_id: int, months: int=6) -> Optional[bytes]:
+    if not HAS_MPL: return None
+    now = datetime.now(TZ)
+    labels = []
+    values = []
+    for i in range(months-1, -1, -1):
+        d = (now.replace(day=1) - timedelta(days=1)).replace(day=1)  # ensure valid
+        # safer month back calc
+    # compute months list correctly
+    labels = []
+    values = []
+    cur = datetime.now(TZ).replace(day=1)
+    seq = []
+    for i in range(months-1, -1, -1):
+        y = cur.year
+        m = cur.month
+        # go back i months
+        total_months = y*12 + m - 1 - i
+        y2 = total_months // 12
+        m2 = total_months % 12 + 1
+        yyyymm = f"{y2:04d}-{m2:02d}"
+        labels.append(yyyymm)
+        values.append(monthly_total(user_id, yyyymm))
+    fig = plt.figure()
+    plt.plot(labels, values, marker="o"); plt.title(f"Monthly Spend (last {months})")
+    plt.xlabel("Month"); plt.ylabel("Amount"); plt.xticks(rotation=45)
+    buf = BytesIO(); fig.tight_layout(); fig.savefig(buf, format="png"); plt.close(fig)
+    return buf.getvalue()
+
 # ---------- Bot setup (aiogram ≥3.7 compatible) ----------
 try:
     from aiogram.client.default import DefaultBotProperties
@@ -531,24 +660,40 @@ def only_owner(x) -> bool:
 def deny_text() -> str:
     return "⛔️ This bot is private."
 
+# ---------- Middleware: auto-delete user messages in private ----------
+class PrivateAutoDelete(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        result = await handler(event, data)
+        try:
+            if isinstance(event, Message) and event.chat and event.chat.type == "private":
+                if event.from_user and event.from_user.id == OWNER_ID and get_delete_user_msgs(OWNER_ID):
+                    # Delete user's message AFTER we processed it
+                    await bot.delete_message(event.chat.id, event.message_id)
+        except Exception:
+            pass
+        return result
+
+# Register global middleware
+dp.update.middleware.register(PrivateAutoDelete())
+
 # ---------- send helpers with auto-clean ----------
 async def send_text(chat_id: int, text: str, kb=None):
     if not text: text = "‎"
     msg = await bot.send_message(chat_id, text, reply_markup=kb)
     record_bot_message(OWNER_ID, chat_id, msg.message_id)
-    await delete_old_bot_messages(chat_id, keep_last=KEEP_LAST_BOT_MSGS)
+    await delete_old_bot_messages(chat_id, keep_last=get_keep_last(OWNER_ID))
     return msg
 
 async def send_photo(chat_id: int, photo_bytes: bytes, filename: str, caption: str, kb=None):
     msg = await bot.send_photo(chat_id, BufferedInputFile(photo_bytes, filename=filename), caption=caption, reply_markup=kb)
     record_bot_message(OWNER_ID, chat_id, msg.message_id)
-    await delete_old_bot_messages(chat_id, keep_last=KEEP_LAST_BOT_MSGS)
+    await delete_old_bot_messages(chat_id, keep_last=get_keep_last(OWNER_ID))
     return msg
 
 async def send_document(chat_id: int, path: Path, caption: str="", kb=None):
     msg = await bot.send_document(chat_id, FSInputFile(path), caption=caption, reply_markup=kb)
     record_bot_message(OWNER_ID, chat_id, msg.message_id)
-    await delete_old_bot_messages(chat_id, keep_last=KEEP_LAST_BOT_MSGS)
+    await delete_old_bot_messages(chat_id, keep_last=get_keep_last(OWNER_ID))
     return msg
 
 async def safe_edit(message, text: str, kb=None):
@@ -575,7 +720,8 @@ def main_kb():
     kb.button(text="📁 Export All (ZIP)", callback_data="export_all")
     kb.button(text="🧼 Reset All", callback_data="reset_all_confirm")
     kb.button(text="ℹ️ Quick Add Help", callback_data="help_quick")
-    kb.adjust(2,2,2,3,2)
+    kb.button(text="⚙️ Extras", callback_data="extras")
+    kb.adjust(2,2,2,3,2,1)
     return kb.as_markup()
 
 def people_kb(user_id: int):
@@ -653,6 +799,37 @@ def import_summary_kb(has_issues: bool):
     kb.adjust(2,2,2)
     return kb.as_markup()
 
+def extras_kb():
+    kb = InlineKeyboardBuilder()
+    # Dev / Ops
+    kb.button(text="🔄 Update Code (pull+install)", callback_data="dev_update")
+    kb.button(text="♻️ Restart Service", callback_data="dev_restart")
+    kb.button(text="📜 Tail Logs", callback_data="dev_logs")
+    kb.button(text="🩺 Health Check", callback_data="dev_health")
+    # Maintenance
+    kb.button(text="🧹 Purge UI Now", callback_data="purge_ui")
+    kb.button(text="💾 Backup DB", callback_data="backup_db")
+    kb.button(text="♻️ Restore DB", callback_data="restore_db")
+    kb.button(text="🧰 Optimize DB (VACUUM)", callback_data="optimize_db")
+    # Analytics
+    kb.button(text="📈 Trend 6 mo", callback_data="trend6")
+    kb.button(text="📑 Export People Summary", callback_data="export_people")
+    kb.button(text="🧾 Export This Month CSV", callback_data="export_month_csv")
+    kb.button(text="⏰ Export Dues CSV", callback_data="export_dues_csv")
+    # Controls
+    kb.button(text="🧮 Apply Interest Now", callback_data="interest_now")
+    kb.button(text="📬 Send Daily Summary", callback_data="send_daily")
+    kb.button(text="🗞 Weekly Digest Now", callback_data="send_weekly")
+    kb.button(text="🔎 Search Person", callback_data="search_person")
+    kb.button(text="👥 Find Duplicates", callback_data="dup_check")
+    kb.button(text=f"🧽 Delete user msgs: {'ON' if get_delete_user_msgs(OWNER_ID) else 'OFF'}", callback_data="toggle_del_user")
+    kb.button(text=f"🧼 Keep Last UI: {get_keep_last(OWNER_ID)}", callback_data="set_keep_last")
+    kb.button(text=f"💱 Currency: {CURRENCY}", callback_data="set_currency")
+    kb.button(text="🔒 Lock Now", callback_data="lock_now")
+    kb.button(text="⬅️ Back", callback_data="back_main")
+    kb.adjust(2,2,2,2,2,2,2,2,1,1)
+    return kb.as_markup()
+
 # ---------- States ----------
 class AddExpenseStates(StatesGroup):
     waiting_amount = State()
@@ -694,6 +871,16 @@ class ImportState(StatesGroup):
 class SupportAIState(StatesGroup):
     waiting_query = State()
 
+# NEW – Extras states
+class RestoreDBState(StatesGroup):
+    waiting_db = State()
+
+class SearchPersonState(StatesGroup):
+    waiting_query = State()
+
+class CurrencyState(StatesGroup):
+    waiting_symbol = State()
+
 # ---------- Handlers ----------
 @router.message(CommandStart())
 async def start_cmd(m: Message):
@@ -701,7 +888,7 @@ async def start_cmd(m: Message):
         if not only_owner(m): return await m.answer(deny_text())
         if BOT_PIN and m.from_user.id not in UNLOCKED:
             return await m.answer("🔒 Enter PIN to unlock:")
-        init_db(); migrate_defaults()
+        migrate_defaults()
         await delete_old_bot_messages(m.chat.id, keep_last=0)  # hard wipe
         await send_text(
             m.chat.id,
@@ -731,6 +918,15 @@ async def back_main(c: CallbackQuery):
         await send_text(c.message.chat.id, "🏠 <b>Main Menu</b>", main_kb()); await c.answer()
     except Exception as e:
         await c.message.answer(f"❌ back error: {e}")
+
+@router.callback_query(F.data == "extras")
+async def extras(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, source_message=c.message, keep_last=0)
+        await send_text(c.message.chat.id, "⚙️ <b>Extras</b>", extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ extras error: {e}")
 
 # Quick Add Help
 @router.callback_query(F.data == "help_quick")
@@ -2116,7 +2312,6 @@ async def apply_monthly_interest():
         update_last_interest_applied(OWNER_ID, p["id"], yyyymm)
 
 async def scheduler_loop():
-    import asyncio
     while True:
         try:
             await apply_monthly_interest()
@@ -2134,11 +2329,342 @@ async def scheduler_loop():
             pass
         await asyncio.sleep(60)
 
+# ---------- EXTRAS (20 features) ----------
+
+async def run_shell(cmd: str) -> str:
+    """Run shell command and return combined output (trimmed)."""
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    out, _ = await proc.communicate()
+    text = (out or b"").decode(errors="ignore")
+    # trim to Telegram safe length
+    if len(text) > 3500:
+        text = text[-3500:]
+    return text.strip() or "(no output)"
+
+@router.callback_query(F.data == "dev_update")
+async def dev_update(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
+        # Pull + install deps in existing venv (no restart here)
+        cmd = (
+            "cd /root/mmnd "
+            "&& git fetch --all --prune "
+            "&& git reset --hard origin/main "
+            "&& . .venv/bin/activate "
+            "&& pip install -U pip wheel "
+            "&& [ -f requirements.txt ] && pip install -r requirements.txt || true "
+            "&& deactivate"
+        )
+        await send_text(c.message.chat.id, "🔄 Updating code…")
+        out = await run_shell(cmd)
+        kb = InlineKeyboardBuilder()
+        kb.button(text="♻️ Restart Service", callback_data="dev_restart")
+        kb.button(text="📜 Tail Logs", callback_data="dev_logs")
+        kb.button(text="⬅️ Back", callback_data="extras")
+        kb.adjust(2,1)
+        await send_text(c.message.chat.id, f"<b>Update result</b>\n<code>{out}</code>", kb.as_markup())
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ update error: {e}")
+
+@router.callback_query(F.data == "dev_restart")
+async def dev_restart(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        # schedule restart in background so we can send ack
+        await run_shell("nohup bash -lc 'sleep 1; systemctl restart expensebot.service' >/dev/null 2>&1 &")
+        await send_text(c.message.chat.id, "♻️ Restart scheduled. Use “📜 Tail Logs” after it comes back.", extras_kb())
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ restart error: {e}")
+
+@router.callback_query(F.data == "dev_logs")
+async def dev_logs(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        out = await run_shell("journalctl -u expensebot.service -n 60 --no-pager")
+        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
+        await send_text(c.message.chat.id, f"<b>Last 60 lines</b>\n<code>{out}</code>", extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ logs error: {e}")
+
+@router.callback_query(F.data == "dev_health")
+async def dev_health(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        st = get_settings(OWNER_ID)
+        db_size = DB_PATH.stat().st_size if DB_PATH.exists() else 0
+        total, used, free = shutil.disk_usage("/")
+        lines = [
+            "🩺 <b>Health</b>",
+            f"Python: {platform.python_version()}",
+            f"Aiogram: {__import__('aiogram').__version__}",
+            f"DB: {DB_PATH} ({db_size/1024/1024:.2f} MB)",
+            f"Disk free: {free/1024/1024/1024:.2f} GB",
+            f"Delete user msgs: {'ON' if get_delete_user_msgs(OWNER_ID) else 'OFF'}",
+            f"Keep-Last UI: {get_keep_last(OWNER_ID)}",
+            f"Daily@{st['daily_hour']:02d} {'ON' if st['daily_reminders'] else 'OFF'}; "
+            f"Weekly DOW {st['weekly_dow']} {'ON' if st['weekly_reminders'] else 'OFF'}",
+        ]
+        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
+        await send_text(c.message.chat.id, "\n".join(lines), extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ health error: {e}")
+
+@router.callback_query(F.data == "purge_ui")
+async def purge_ui(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await delete_old_bot_messages(c.message.chat.id, keep_last=0)
+        await send_text(c.message.chat.id, "🧹 Purged all prior UI.", extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ purge error: {e}")
+
+@router.callback_query(F.data == "interest_now")
+async def interest_now(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await apply_monthly_interest()
+        await send_text(c.message.chat.id, "💠 Applied monthly interest for current month (where applicable).", extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ interest error: {e}")
+
+@router.callback_query(F.data == "send_daily")
+async def send_daily_now(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await send_daily_summary()
+        await send_text(c.message.chat.id, "📬 Daily summary sent to you.", extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ daily error: {e}")
+
+@router.callback_query(F.data == "send_weekly")
+async def send_weekly_now(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await send_weekly_digest()
+        await send_text(c.message.chat.id, "🗞 Weekly digest sent to you.", extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ weekly error: {e}")
+
+@router.callback_query(F.data == "export_people")
+async def extra_export_people(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        p = export_people_summary_csv(OWNER_ID)
+        await send_document(c.message.chat.id, p, caption="📑 People Summary CSV", kb=extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ export people error: {e}")
+
+@router.callback_query(F.data == "export_month_csv")
+async def extra_export_month(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        p = export_expenses_month_csv(OWNER_ID, cur_yyyymm())
+        await send_document(c.message.chat.id, p, caption=f"🧾 Expenses {cur_yyyymm()}", kb=extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ export month error: {e}")
+
+@router.callback_query(F.data == "export_dues_csv")
+async def extra_export_dues(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        p = export_dues_csv(OWNER_ID, 30)
+        await send_document(c.message.chat.id, p, caption="⏰ Dues (next 30 days)", kb=extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ export dues error: {e}")
+
+@router.callback_query(F.data == "backup_db")
+async def backup_db(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        out_dir = DATA_DIR / f"user_{OWNER_ID}"; out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(TZ).strftime("%Y-%m-%d_%H-%M")
+        bpath = out_dir / f"db_backup_{ts}.sqlite"
+        if DB_PATH.exists():
+            shutil.copy2(DB_PATH, bpath)
+            await send_document(c.message.chat.id, bpath, caption="💾 DB backup", kb=extras_kb())
+        else:
+            await send_text(c.message.chat.id, "DB file not found.", extras_kb())
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ backup error: {e}")
+
+@router.callback_query(F.data == "restore_db")
+async def restore_db_prompt(c: CallbackQuery, state: FSMContext):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await state.set_state(RestoreDBState.waiting_db)
+        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
+        await send_text(c.message.chat.id, "♻️ Send the <b>.sqlite/.db</b> file to restore. I will replace current DB."); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ restore prompt error: {e}")
+
+@router.message(RestoreDBState.waiting_db, F.document)
+async def restore_db_handle(m: Message, state: FSMContext):
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        fname = (m.document.file_name or "").lower()
+        if not (fname.endswith(".sqlite") or fname.endswith(".db")):
+            return await m.answer("⚠️ Please send a .sqlite or .db file.")
+        tmp = Path("imports") / f"restore_{int(time.time())}.sqlite"
+        tmp.parent.mkdir(exist_ok=True)
+        await _download_document(m.document, tmp)
+        # replace DB atomically
+        if DB_PATH.exists():
+            shutil.copy2(DB_PATH, DB_PATH.with_suffix(".bak"))
+        os.replace(tmp, DB_PATH)
+        await state.clear()
+        await send_text(m.chat.id, "✅ Restored DB. You may /start again if needed.", extras_kb())
+    except Exception as e:
+        await m.answer(f"❌ restore error: {e}")
+
+@router.callback_query(F.data == "optimize_db")
+async def optimize_db(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        con = db(); cur = con.cursor()
+        cur.execute("VACUUM"); con.commit(); con.close()
+        await send_text(c.message.chat.id, "🧰 VACUUM complete.", extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ vacuum error: {e}")
+
+@router.callback_query(F.data == "trend6")
+async def trend6(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        png = render_monthly_trend_png(OWNER_ID, 6)
+        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
+        if not png:
+            return await send_text(c.message.chat.id, "ℹ️ No data or chart engine unavailable.", extras_kb())
+        await send_photo(c.message.chat.id, png, "trend6.png", "📈 Monthly Spend (last 6 months)", extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ trend error: {e}")
+
+@router.callback_query(F.data == "search_person")
+async def search_person_prompt(c: CallbackQuery, state: FSMContext):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await state.set_state(SearchPersonState.waiting_query)
+        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
+        await send_text(c.message.chat.id, "🔎 Type part of the name to search:"); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ search prompt error: {e}")
+
+@router.message(SearchPersonState.waiting_query)
+async def search_person_do(m: Message, state: FSMContext):
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        q = canonical(m.text)
+        hits = []
+        for p in get_people(OWNER_ID):
+            if q in canonical(p["display_name"]):
+                bal = person_balance(OWNER_ID, p["id"])
+                hits.append(f"• {p['display_name']} — {CURRENCY}{bal:,.2f}")
+        await state.clear()
+        if not hits:
+            await send_text(m.chat.id, "No matches.", extras_kb())
+        else:
+            await send_text(m.chat.id, "Results:\n" + "\n".join(hits), extras_kb())
+    except Exception as e:
+        await m.answer(f"❌ search error: {e}")
+
+@router.callback_query(F.data == "dup_check")
+async def dup_check(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        names = [p["display_name"] for p in get_people(OWNER_ID)]
+        pairs = []
+        for i in range(len(names)):
+            for j in range(i+1, len(names)):
+                r = difflib.SequenceMatcher(None, names[i].lower(), names[j].lower()).ratio()
+                if r >= 0.85:
+                    pairs.append(f"• {names[i]} ↔ {names[j]} ({r*100:.0f}%)")
+        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
+        if not pairs:
+            await send_text(c.message.chat.id, "✅ No likely duplicates.", extras_kb())
+        else:
+            await send_text(c.message.chat.id, "👥 Possible duplicates:\n" + "\n".join(pairs), extras_kb())
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ dup error: {e}")
+
+@router.callback_query(F.data == "toggle_del_user")
+async def toggle_del_user(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        cur = get_delete_user_msgs(OWNER_ID)
+        set_setting(OWNER_ID, "delete_user_msgs", 0 if cur else 1)
+        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
+        await send_text(c.message.chat.id, f"🧽 Delete user messages: {'ON' if not cur else 'OFF'}", extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ toggle del error: {e}")
+
+@router.callback_query(F.data == "set_keep_last")
+async def set_keep_last_prompt(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        kb = InlineKeyboardBuilder()
+        for n in [0,1,2,3]:
+            kb.button(text=str(n), callback_data=f"keep_last:{n}")
+        kb.button(text="⬅️ Extras", callback_data="extras")
+        kb.adjust(4,1)
+        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
+        await send_text(c.message.chat.id, "How many latest UI messages to keep?", kb.as_markup()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ keep last ui error: {e}")
+
+@router.callback_query(F.data.startswith("keep_last:"))
+async def set_keep_last_do(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        n = int(c.data.split(":")[1])
+        set_setting(OWNER_ID, "keep_last_bot_msgs", n)
+        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
+        await send_text(c.message.chat.id, f"✅ Keep-Last set to {n}.", extras_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ keep last set error: {e}")
+
+@router.callback_query(F.data == "set_currency")
+async def set_currency_prompt(c: CallbackQuery, state: FSMContext):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await state.set_state(CurrencyState.waiting_symbol)
+        await wipe_ui(c.message.chat.id, c.message, keep_last=0)
+        await send_text(c.message.chat.id, "💱 Send currency symbol (e.g., ₹, $, €, INR, etc. up to 3 chars):"); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ set currency prompt error: {e}")
+
+@router.message(CurrencyState.waiting_symbol)
+async def set_currency_do(m: Message, state: FSMContext):
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        sym = (m.text or "").strip()[:3] or "₹"
+        set_currency(OWNER_ID, sym)
+        await state.clear()
+        await send_text(m.chat.id, f"✅ Currency set to {sym}.", extras_kb())
+    except Exception as e:
+        await m.answer(f"❌ set currency error: {e}")
+
+@router.callback_query(F.data == "lock_now")
+async def lock_now(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        if BOT_PIN:
+            UNLOCKED.discard(OWNER_ID)
+            await wipe_ui(c.message.chat.id, c.message, keep_last=0)
+            await send_text(c.message.chat.id, "🔒 Locked. Send PIN again to unlock.", main_kb()); await c.answer()
+        else:
+            await c.message.answer("No PIN configured (BOT_PIN).")
+    except Exception as e:
+        await c.message.answer(f"❌ lock error: {e}")
+
 # Startup/shutdown
 @dp.startup.register
 async def on_startup():
-    import asyncio
-    init_db(); migrate_defaults()
+    migrate_defaults()
     global SCHED_TASK
     try:
         SCHED_TASK = asyncio.create_task(scheduler_loop())
@@ -2147,7 +2673,6 @@ async def on_startup():
 
 @dp.shutdown.register
 async def on_shutdown():
-    import asyncio
     global SCHED_TASK
     if SCHED_TASK:
         SCHED_TASK.cancel()
@@ -2158,7 +2683,6 @@ async def on_shutdown():
 
 # ---------- Main ----------
 if __name__ == "__main__":
-    import asyncio
     try:
         asyncio.run(dp.start_polling(bot))
     except (KeyboardInterrupt, SystemExit):
