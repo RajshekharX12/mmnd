@@ -1,8 +1,3 @@
-
----
-
-## expense_bot.py
-```python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -171,7 +166,6 @@ def parse_date_fuzzy(s: str) -> Optional[datetime]:
             return datetime(dt.year, dt.month, dt.day, tzinfo=TZ)
         except Exception:
             continue
-    # try ISO or pandas if available
     try:
         return datetime.fromisoformat(s).replace(tzinfo=TZ)
     except Exception:
@@ -482,8 +476,7 @@ def main_kb():
     kb.button(text="🔔 Reminders", callback_data="reminders")
     kb.button(text="↩️ Undo", callback_data="undo")
     kb.button(text="📁 Export All (ZIP)", callback_data="export_all")
-    kb.button(text="ℹ️ Quick Add Help", callback_data="help_quick")
-    kb.adjust(2,2,2,3,2)
+    kb.adjust(2,2,2,3,1)
     return kb.as_markup()
 
 def people_kb(user_id: int):
@@ -568,422 +561,546 @@ class SupportAIState(StatesGroup):
 # ---------- Handlers ----------
 @router.message(CommandStart())
 async def start_cmd(m: Message):
-    if not only_owner(m):
-        return await m.answer(deny_text())
-    if BOT_PIN and m.from_user.id not in UNLOCKED:
-        return await m.answer("🔒 Enter PIN to unlock:")
-    init_db(); migrate_defaults()
-    await m.answer(
-        "👋 <b>Expense & Lending Assistant</b>\n"
-        "• <b>Legend</b>: + means they owe you; – means you owe them.\n"
-        f"• Currency: <b>{CURRENCY}</b>\n"
-        "• Quick-add: <code>Ajay +500 cab</code> or <code>500 &gt; add to &gt; Ajay</code>",
-        reply_markup=main_kb()
-    )
+    try:
+        if not only_owner(m):
+            return await m.answer(deny_text())
+        if BOT_PIN and m.from_user.id not in UNLOCKED:
+            return await m.answer("🔒 Enter PIN to unlock:")
+        init_db(); migrate_defaults()
+        await m.answer(
+            "👋 <b>Expense & Lending Assistant</b>\n"
+            "• <b>Legend</b>: + means they owe you; – means you owe them.\n"
+            f"• Currency: <b>{CURRENCY}</b>\n"
+            "• Quick-add: <code>Ajay +500 cab</code> or <code>500 &gt; add to &gt; Ajay</code>",
+            reply_markup=main_kb()
+        )
+    except Exception as e:
+        await m.answer(f"❌ start error: {e}")
 
 @router.message(F.text.regexp(r"^\d{4,8}$"))
 async def pin_try(m: Message):
-    if BOT_PIN and (m.text.strip() == BOT_PIN) and only_owner(m):
-        UNLOCKED.add(m.from_user.id)
-        return await start_cmd(m)
+    try:
+        if BOT_PIN and (m.text.strip() == BOT_PIN) and only_owner(m):
+            UNLOCKED.add(m.from_user.id)
+            return await start_cmd(m)
+    except Exception as e:
+        await m.answer(f"❌ pin error: {e}")
 
 @router.callback_query(F.data == "back_main")
 async def back_main(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    await c.message.edit_text("🏠 <b>Main Menu</b>", reply_markup=main_kb()); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await c.message.edit_text("🏠 <b>Main Menu</b>", reply_markup=main_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ back error: {e}")
 
 # Add Expense
 EXP_CATS = ["Food","Travel","Bills","Other"]
 
 @router.callback_query(F.data == "add_expense")
 async def cb_add_expense(c: CallbackQuery, state: FSMContext):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    await state.set_state(AddExpenseStates.waiting_amount)
-    await c.message.edit_text("➕ Enter expense amount (number):", reply_markup=None); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await state.set_state(AddExpenseStates.waiting_amount)
+        await c.message.edit_text("➕ Enter expense amount (number):", reply_markup=None); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ expense error: {e}")
 
 @router.message(AddExpenseStates.waiting_amount)
 async def get_exp_amount(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
     try:
-        amt = float(m.text.strip()); assert amt > 0
-    except Exception:
-        return await m.answer("⚠️ Send a valid positive number for amount.")
-    await state.update_data(amount=amt)
-    kb = InlineKeyboardBuilder()
-    for cat in EXP_CATS: kb.button(text=cat, callback_data=f"exp_cat:{cat}")
-    kb.adjust(2,2)
-    await state.set_state(AddExpenseStates.waiting_category)
-    await m.answer("🏷️ Pick a category:", reply_markup=kb.as_markup())
+        if not only_owner(m): return await m.answer(deny_text())
+        try:
+            amt = float(m.text.strip()); assert amt > 0
+        except Exception:
+            return await m.answer("⚠️ Send a valid positive number for amount.")
+        await state.update_data(amount=amt)
+        kb = InlineKeyboardBuilder()
+        for cat in EXP_CATS: kb.button(text=cat, callback_data=f"exp_cat:{cat}")
+        kb.adjust(2,2)
+        await state.set_state(AddExpenseStates.waiting_category)
+        await m.answer("🏷️ Pick a category:", reply_markup=kb.as_markup())
+    except Exception as e:
+        await m.answer(f"❌ exp amount error: {e}")
 
 @router.callback_query(F.data.startswith("exp_cat:"))
 async def pick_cat(c: CallbackQuery, state: FSMContext):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    cat = c.data.split(":")[1]
-    await state.update_data(category=cat)
-    await state.set_state(AddExpenseStates.waiting_note)
-    await c.message.edit_text("📝 Optional note? (or type <code>skip</code>)", reply_markup=None); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        cat = c.data.split(":")[1]
+        await state.update_data(category=cat)
+        await state.set_state(AddExpenseStates.waiting_note)
+        await c.message.edit_text("📝 Optional note? (or type <code>skip</code>)", reply_markup=None); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ exp cat error: {e}")
 
 @router.message(AddExpenseStates.waiting_note)
 async def get_exp_note(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
-    data = await state.get_data()
-    note = None if m.text.strip().lower() == "skip" else m.text.strip()
-    eid = add_expense(OWNER_ID, data["amount"], note, data.get("category"))
-    log_action(OWNER_ID, "expense", "expenses", eid)
-    await state.clear()
-    total = monthly_total(OWNER_ID)
-    await m.answer(
-        f"✅ Expense saved: {CURRENCY}{data['amount']:,.2f} [{data.get('category','Other')}]\n"
-        f"🧮 This month: {CURRENCY}{total:,.2f}",
-        reply_markup=main_kb()
-    )
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        data = await state.get_data()
+        note = None if m.text.strip().lower() == "skip" else m.text.strip()
+        eid = add_expense(OWNER_ID, data["amount"], note, data.get("category"))
+        log_action(OWNER_ID, "expense", "expenses", eid)
+        await state.clear()
+        total = monthly_total(OWNER_ID)
+        await m.answer(
+            f"✅ Expense saved: {CURRENCY}{data['amount']:,.2f} [{data.get('category','Other')}]\n"
+            f"🧮 This month: {CURRENCY}{total:,.2f}",
+            reply_markup=main_kb()
+        )
+    except Exception as e:
+        await m.answer(f"❌ exp save error: {e}")
 
 # People
 @router.callback_query(F.data == "people")
 async def cb_people(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    await c.message.edit_text("👥 <b>People</b>\n(+ means they owe you)", reply_markup=people_kb(OWNER_ID)); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await c.message.edit_text("👥 <b>People</b>\n(+ means they owe you)", reply_markup=people_kb(OWNER_ID)); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ people error: {e}")
 
 @router.callback_query(F.data == "person_add")
 async def cb_person_add(c: CallbackQuery, state: FSMContext):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    await state.set_state(AddPersonStates.waiting_name)
-    await c.message.edit_text("👤 Send the person’s name to add:", reply_markup=None); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await state.set_state(AddPersonStates.waiting_name)
+        await c.message.edit_text("👤 Send the person’s name to add:", reply_markup=None); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ person add error: {e}")
 
 @router.message(AddPersonStates.waiting_name)
 async def person_add_name(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
-    pid, err = add_person(OWNER_ID, m.text)
-    await state.clear()
-    if err: return await m.answer(f"⚠️ {err}", reply_markup=people_kb(OWNER_ID))
-    await m.answer(f"✅ Added <b>{m.text.strip()}</b>.", reply_markup=people_kb(OWNER_ID))
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        pid, err = add_person(OWNER_ID, m.text)
+        await state.clear()
+        if err: return await m.answer(f"⚠️ {err}", reply_markup=people_kb(OWNER_ID))
+        await m.answer(f"✅ Added <b>{m.text.strip()}</b>.", reply_markup=people_kb(OWNER_ID))
+    except Exception as e:
+        await m.answer(f"❌ person save error: {e}")
 
 @router.callback_query(F.data.startswith("person_menu:"))
 async def cb_person_menu(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    pid = int(c.data.split(":")[1])
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT display_name, credit_limit, monthly_interest_rate FROM people WHERE user_id=? AND id=?",
-                (OWNER_ID, pid))
-    row = cur.fetchone(); con.close()
-    if not row: return await c.answer("Not found")
-    name = row["display_name"]
-    bal = person_balance(OWNER_ID, pid)
-    rate = row["monthly_interest_rate"]
-    limit = row["credit_limit"]
-    text = (f"👤 <b>{name}</b>\n"
-            f"💼 Balance: <b>{CURRENCY}{bal:,.2f}</b>\n"
-            f"🎯 Limit: {'' if limit is not None else '(not set) '}{CURRENCY}{(limit or 0):,.2f}\n"
-            f"💠 Interest: {rate if rate is not None else 0:.2f}% / month")
-    await c.message.edit_text(text, reply_markup=person_menu_kb(pid)); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        pid = int(c.data.split(":")[1])
+        con = db(); cur = con.cursor()
+        cur.execute("SELECT display_name, credit_limit, monthly_interest_rate FROM people WHERE user_id=? AND id=?",
+                    (OWNER_ID, pid))
+        row = cur.fetchone(); con.close()
+        if not row: return await c.answer("Not found")
+        name = row["display_name"]
+        bal = person_balance(OWNER_ID, pid)
+        rate = row["monthly_interest_rate"]
+        limit = row["credit_limit"]
+        text = (f"👤 <b>{name}</b>\n"
+                f"💼 Balance: <b>{CURRENCY}{bal:,.2f}</b>\n"
+                f"🎯 Limit: {'' if limit is not None else '(not set) '}{CURRENCY}{(limit or 0):,.2f}\n"
+                f"💠 Interest: {rate if rate is not None else 0:.2f}% / month")
+        await c.message.edit_text(text, reply_markup=person_menu_kb(pid)); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ person menu error: {e}")
 
 # Lend with due date
 @router.callback_query(F.data.startswith("lend:"))
 async def cb_lend(c: CallbackQuery, state: FSMContext):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    pid = int(c.data.split(":")[1])
-    await state.set_state(LendStates.waiting_amount); await state.update_data(person_id=pid)
-    await c.message.edit_text("➕ Enter LEND amount (they owe you):", reply_markup=None); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        pid = int(c.data.split(":")[1])
+        await state.set_state(LendStates.waiting_amount); await state.update_data(person_id=pid)
+        await c.message.edit_text("➕ Enter LEND amount (they owe you):", reply_markup=None); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ lend error: {e}")
 
 @router.message(LendStates.waiting_amount)
 async def lend_amount(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
     try:
-        amt = float(m.text.strip()); assert amt > 0
-    except Exception:
-        return await m.answer("⚠️ Send a valid positive number.")
-    await state.update_data(amount=amt)
-    await state.set_state(LendStates.waiting_note)
-    await m.answer("📝 Optional note? (or type <code>skip</code>)")
+        if not only_owner(m): return await m.answer(deny_text())
+        try:
+            amt = float(m.text.strip()); assert amt > 0
+        except Exception:
+            return await m.answer("⚠️ Send a valid positive number.")
+        await state.update_data(amount=amt)
+        await state.set_state(LendStates.waiting_note)
+        await m.answer("📝 Optional note? (or type <code>skip</code>)")
+    except Exception as e:
+        await m.answer(f"❌ lend amount error: {e}")
 
 @router.message(LendStates.waiting_note)
 async def lend_note(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
-    await state.update_data(note=None if m.text.strip().lower()=="skip" else m.text.strip())
-    await state.set_state(LendStates.waiting_due)
-    await m.answer("📅 Optional due date (YYYY-MM-DD) or type <code>skip</code>")
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        await state.update_data(note=None if m.text.strip().lower()=="skip" else m.text.strip())
+        await state.set_state(LendStates.waiting_due)
+        await m.answer("📅 Optional due date (YYYY-MM-DD) or type <code>skip</code>")
+    except Exception as e:
+        await m.answer(f"❌ lend note error: {e}")
 
 @router.message(LendStates.waiting_due)
 async def lend_due(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
-    data = await state.get_data()
-    due_ts = None
-    t = m.text.strip().lower()
-    if t != "skip":
-        d = parse_date_fuzzy(t)
-        if not d: return await m.answer("⚠️ Use YYYY-MM-DD (or common formats) or 'skip'")
-        due_ts = int(d.replace(hour=23, minute=59).timestamp())
-    lid = add_ledger(OWNER_ID, data["person_id"], "lend", data["amount"], data.get("note"), due_ts)
-    log_action(OWNER_ID, "ledger", "ledger", lid)
-    await state.clear()
-    bal = person_balance(OWNER_ID, data["person_id"])
-    limit = get_credit_limit(OWNER_ID, data["person_id"])
-    warn = f"\n⚠️ <b>Over limit</b> (limit {CURRENCY}{limit:,.2f})" if (limit is not None and bal>float(limit)) else ""
-    dd = "" if not due_ts else "\n⏰ Due " + datetime.fromtimestamp(due_ts, TZ).strftime("%d %b")
-    await m.answer(f"✅ Lend saved: {CURRENCY}{data['amount']:,.2f}{dd}\n"
-                   f"💼 New balance: {CURRENCY}{bal:,.2f}{warn}",
-                   reply_markup=people_kb(OWNER_ID))
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        data = await state.get_data()
+        due_ts = None
+        t = m.text.strip().lower()
+        if t != "skip":
+            d = parse_date_fuzzy(t)
+            if not d: return await m.answer("⚠️ Use YYYY-MM-DD (or common formats) or 'skip'")
+            due_ts = int(d.replace(hour=23, minute=59).timestamp())
+        lid = add_ledger(OWNER_ID, data["person_id"], "lend", data["amount"], data.get("note"), due_ts)
+        log_action(OWNER_ID, "ledger", "ledger", lid)
+        await state.clear()
+        bal = person_balance(OWNER_ID, data["person_id"])
+        limit = get_credit_limit(OWNER_ID, data["person_id"])
+        warn = f"\n⚠️ <b>Over limit</b> (limit {CURRENCY}{limit:,.2f})" if (limit is not None and bal>float(limit)) else ""
+        dd = "" if not due_ts else "\n⏰ Due " + datetime.fromtimestamp(due_ts, TZ).strftime("%d %b")
+        await m.answer(f"✅ Lend saved: {CURRENCY}{data['amount']:,.2f}{dd}\n"
+                       f"💼 New balance: {CURRENCY}{bal:,.2f}{warn}",
+                       reply_markup=people_kb(OWNER_ID))
+    except Exception as e:
+        await m.answer(f"❌ lend save error: {e}")
 
 # Repay
 @router.callback_query(F.data.startswith("repay:"))
 async def cb_repay(c: CallbackQuery, state: FSMContext):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    pid = int(c.data.split(":")[1])
-    await state.set_state(RepayStates.waiting_amount); await state.update_data(person_id=pid)
-    await c.message.edit_text("💸 Enter REPAY amount (they returned to you):", reply_markup=None); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        pid = int(c.data.split(":")[1])
+        await state.set_state(RepayStates.waiting_amount); await state.update_data(person_id=pid)
+        await c.message.edit_text("💸 Enter REPAY amount (they returned to you):", reply_markup=None); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ repay error: {e}")
 
 @router.message(RepayStates.waiting_amount)
 async def repay_amount(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
     try:
-        amt = float(m.text.strip()); assert amt > 0
-    except Exception:
-        return await m.answer("⚠️ Send a valid positive number.")
-    await state.update_data(amount=amt)
-    await state.set_state(RepayStates.waiting_note)
-    await m.answer("📝 Optional note? (or type <code>skip</code>)")
+        if not only_owner(m): return await m.answer(deny_text())
+        try:
+            amt = float(m.text.strip()); assert amt > 0
+        except Exception:
+            return await m.answer("⚠️ Send a valid positive number.")
+        await state.update_data(amount=amt)
+        await state.set_state(RepayStates.waiting_note)
+        await m.answer("📝 Optional note? (or type <code>skip</code>)")
+    except Exception as e:
+        await m.answer(f"❌ repay amount error: {e}")
 
 @router.message(RepayStates.waiting_note)
 async def repay_note(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
-    data = await state.get_data()
-    note = None if m.text.strip().lower()=="skip" else m.text.strip()
-    lid = add_ledger(OWNER_ID, data["person_id"], "repay", data["amount"], note)
-    log_action(OWNER_ID, "ledger", "ledger", lid)
-    await state.clear()
-    bal = person_balance(OWNER_ID, data["person_id"])
-    await m.answer(f"✅ Repay saved: {CURRENCY}{data['amount']:,.2f}\n"
-                   f"💼 New balance: {CURRENCY}{bal:,.2f}",
-                   reply_markup=people_kb(OWNER_ID))
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        data = await state.get_data()
+        note = None if m.text.strip().lower()=="skip" else m.text.strip()
+        lid = add_ledger(OWNER_ID, data["person_id"], "repay", data["amount"], note)
+        log_action(OWNER_ID, "ledger", "ledger", lid)
+        await state.clear()
+        bal = person_balance(OWNER_ID, data["person_id"])
+        await m.answer(f"✅ Repay saved: {CURRENCY}{data['amount']:,.2f}\n"
+                       f"💼 New balance: {CURRENCY}{bal:,.2f}",
+                       reply_markup=people_kb(OWNER_ID))
+    except Exception as e:
+        await m.answer(f"❌ repay save error: {e}")
 
 # Settle
 @router.callback_query(F.data.startswith("settle:"))
 async def cb_settle(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    pid = int(c.data.split(":")[1])
-    bal = person_balance(OWNER_ID, pid)
-    if abs(bal) < 1e-9:
-        await c.answer("Already settled"); return
-    if bal > 0:
-        lid = add_ledger(OWNER_ID, pid, "repay", bal, "auto-settle")
-    else:
-        lid = add_ledger(OWNER_ID, pid, "lend", abs(bal), "auto-settle")
-    log_action(OWNER_ID, "ledger", "ledger", lid)
-    new_bal = person_balance(OWNER_ID, pid)
-    await c.message.answer(f"🤝 Settled. Balance now {CURRENCY}{new_bal:,.2f}.", reply_markup=people_kb(OWNER_ID))
-    await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        pid = int(c.data.split(":")[1])
+        bal = person_balance(OWNER_ID, pid)
+        if abs(bal) < 1e-9:
+            await c.answer("Already settled"); return
+        if bal > 0:
+            lid = add_ledger(OWNER_ID, pid, "repay", bal, "auto-settle")
+        else:
+            lid = add_ledger(OWNER_ID, pid, "lend", abs(bal), "auto-settle")
+        log_action(OWNER_ID, "ledger", "ledger", lid)
+        new_bal = person_balance(OWNER_ID, pid)
+        await c.message.answer(f"🤝 Settled. Balance now {CURRENCY}{new_bal:,.2f}.", reply_markup=people_kb(OWNER_ID))
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ settle error: {e}")
 
 # Limits
 @router.callback_query(F.data.startswith("setlimit:"))
 async def cb_setlimit(c: CallbackQuery, state: FSMContext):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    pid = int(c.data.split(":")[1])
-    await state.set_state(LimitState.waiting_amount); await state.update_data(person_id=pid)
-    await c.message.edit_text("🎯 Send limit amount (number) or <code>0</code> to clear.", reply_markup=None); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        pid = int(c.data.split(":")[1])
+        await state.set_state(LimitState.waiting_amount); await state.update_data(person_id=pid)
+        await c.message.edit_text("🎯 Send limit amount (number) or <code>0</code> to clear.", reply_markup=None); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ setlimit error: {e}")
 
 @router.message(LimitState.waiting_amount)
 async def setlimit_amount(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
     try:
-        amt = float(m.text.strip())
-    except Exception:
-        return await m.answer("⚠️ Send a valid number.")
-    data = await state.get_data(); pid = data["person_id"]
-    set_credit_limit(OWNER_ID, pid, None if amt <= 0 else amt)
-    await state.clear()
-    await m.answer("✅ Limit updated.", reply_markup=people_kb(OWNER_ID))
+        if not only_owner(m): return await m.answer(deny_text())
+        try:
+            amt = float(m.text.strip())
+        except Exception:
+            return await m.answer("⚠️ Send a valid number.")
+        data = await state.get_data(); pid = data["person_id"]
+        set_credit_limit(OWNER_ID, pid, None if amt <= 0 else amt)
+        await state.clear()
+        await m.answer("✅ Limit updated.", reply_markup=people_kb(OWNER_ID))
+    except Exception as e:
+        await m.answer(f"❌ setlimit save error: {e}")
 
 # Interest
 @router.callback_query(F.data.startswith("setinterest:"))
 async def cb_setinterest(c: CallbackQuery, state: FSMContext):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    pid = int(c.data.split(":")[1])
-    await state.set_state(InterestState.waiting_rate); await state.update_data(person_id=pid)
-    await c.message.edit_text("💠 Send monthly interest rate in % (e.g., 2 for 2%). Use 0 to clear.", reply_markup=None); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        pid = int(c.data.split(":")[1])
+        await state.set_state(InterestState.waiting_rate); await state.update_data(person_id=pid)
+        await c.message.edit_text("💠 Send monthly interest rate in % (e.g., 2 for 2%). Use 0 to clear.", reply_markup=None); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ setinterest error: {e}")
 
 @router.message(InterestState.waiting_rate)
 async def setinterest_rate(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
     try:
-        rate = float(m.text.strip()); assert rate >= 0
-    except Exception:
-        return await m.answer("⚠️ Send a non-negative number.")
-    data = await state.get_data(); pid = data["person_id"]
-    set_interest_rate(OWNER_ID, pid, None if rate == 0 else rate)
-    await state.clear()
-    await m.answer("✅ Interest updated.", reply_markup=people_kb(OWNER_ID))
+        if not only_owner(m): return await m.answer(deny_text())
+        try:
+            rate = float(m.text.strip()); assert rate >= 0
+        except Exception:
+            return await m.answer("⚠️ Send a non-negative number.")
+        data = await state.get_data(); pid = data["person_id"]
+        set_interest_rate(OWNER_ID, pid, None if rate == 0 else rate)
+        await state.clear()
+        await m.answer("✅ Interest updated.", reply_markup=people_kb(OWNER_ID))
+    except Exception as e:
+        await m.answer(f"❌ setinterest save error: {e}")
 
 # Ledger & Export
 @router.callback_query(F.data.startswith("ledger:"))
 async def cb_ledger(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    pid = int(c.data.split(":")[1])
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT display_name FROM people WHERE user_id=? AND id=?", (OWNER_ID, pid))
-    row = cur.fetchone(); con.close()
-    if not row: return await c.answer("Not found")
-    name = row["display_name"]
-    rows = get_ledger(OWNER_ID, pid)
-    if not rows:
-        text = f"🗒 Ledger for <b>{name}</b> is empty."
-    else:
-        last = rows[-10:]
-        lines = []
-        for r in last:
-            dt = datetime.fromtimestamp(r["ts"], TZ).strftime("%d %b %H:%M")
-            sym = {"lend":"➕","repay":"➖","interest":"➕"}[r["type"]]
-            due = f" ⏰{datetime.fromtimestamp(r['due_ts'], TZ).strftime('%d %b')}" if r["due_ts"] else ""
-            lines.append(f"{dt} {sym} {CURRENCY}{float(r['amount']):,.2f}{due} — {r['note']}")
-        bal = person_balance(OWNER_ID, pid)
-        text = (f"🗒 <b>{name}</b> (last {len(last)} of {len(rows)})\n" +
-                "\n".join(lines) +
-                f"\n\n💼 Balance: <b>{CURRENCY}{bal:,.2f}</b>")
-    await c.message.edit_text(text, reply_markup=person_menu_kb(pid)); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        pid = int(c.data.split(":")[1])
+        con = db(); cur = con.cursor()
+        cur.execute("SELECT display_name FROM people WHERE user_id=? AND id=?", (OWNER_ID, pid))
+        row = cur.fetchone(); con.close()
+        if not row: return await c.answer("Not found")
+        name = row["display_name"]
+        rows = get_ledger(OWNER_ID, pid)
+        if not rows:
+            text = f"🗒 Ledger for <b>{name}</b> is empty."
+        else:
+            last = rows[-10:]
+            lines = []
+            for r in last:
+                dt = datetime.fromtimestamp(r["ts"], TZ).strftime("%d %b %H:%M")
+                sym = {"lend":"➕","repay":"➖","interest":"➕"}[r["type"]]
+                due = f" ⏰{datetime.fromtimestamp(r['due_ts'], TZ).strftime('%d %b')}" if r["due_ts"] else ""
+                lines.append(f"{dt} {sym} {CURRENCY}{float(r['amount']):,.2f}{due} — {r['note']}")
+            bal = person_balance(OWNER_ID, pid)
+            text = (f"🗒 <b>{name}</b> (last {len(last)} of {len(rows)})\n" +
+                    "\n".join(lines) +
+                    f"\n\n💼 Balance: <b>{CURRENCY}{bal:,.2f}</b>")
+        await c.message.edit_text(text, reply_markup=person_menu_kb(pid)); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ ledger error: {e}")
 
 @router.callback_query(F.data.startswith("export_person:"))
 async def cb_export_person(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    pid = int(c.data.split(":")[1])
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT display_name FROM people WHERE user_id=? AND id=?", (OWNER_ID, pid))
-    row = cur.fetchone(); con.close()
-    if not row: return await c.answer("Not found")
-    name = row["display_name"]
-    fpath = export_person_csv(OWNER_ID, pid, name)
-    await c.message.answer_document(FSInputFile(fpath), caption=f"📄 Ledger: {name}")
-    await c.answer("Exported")
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        pid = int(c.data.split(":")[1])
+        con = db(); cur = con.cursor()
+        cur.execute("SELECT display_name FROM people WHERE user_id=? AND id=?", (OWNER_ID, pid))
+        row = cur.fetchone(); con.close()
+        if not row: return await c.answer("Not found")
+        name = row["display_name"]
+        fpath = export_person_csv(OWNER_ID, pid, name)
+        await c.message.answer_document(FSInputFile(fpath), caption=f"📄 Ledger: {name}")
+        await c.answer("Exported")
+    except Exception as e:
+        await c.message.answer(f"❌ export person error: {e}")
+
+@router.callback_query(F.data == "export_all")
+async def cb_export_all(c: CallbackQuery):
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        zpath = export_all_zip(OWNER_ID)
+        await c.message.answer_document(FSInputFile(zpath), caption="📦 All ledgers + expenses")
+        await c.answer("Exported")
+    except Exception as e:
+        await c.message.answer(f"❌ export all error: {e}")
 
 @router.callback_query(F.data.startswith("person_delete:"))
 async def cb_person_delete(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    pid = int(c.data.split(":")[1])
-    delete_person(OWNER_ID, pid)
-    await c.message.edit_text("🗑 Deleted. Back to people list.", reply_markup=people_kb(OWNER_ID)); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        pid = int(c.data.split(":")[1])
+        delete_person(OWNER_ID, pid)
+        await c.message.edit_text("🗑 Deleted. Back to people list.", reply_markup=people_kb(OWNER_ID)); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ person delete error: {e}")
 
 # Monthly + Category chart
 @router.callback_query(F.data == "monthly")
 async def cb_monthly(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    month = cur_yyyymm(); total = monthly_total(OWNER_ID, month)
-    tb = top_balances(OWNER_ID, 5)
-    lines = [f"📊 <b>{month} Summary</b>",
-             f"🧾 Personal Spend: <b>{CURRENCY}{total:,.2f}</b>"]
-    cats = monthly_by_category(OWNER_ID, month)
-    if cats:
-        lines.append("\n🏷️ By category:")
-        for r in cats:
-            lines.append(f"• {r['cat']}: {CURRENCY}{float(r['s']):,.2f}")
-    if tb:
-        lines.append("\n👥 Top balances:")
-        for r in tb:
-            lines.append(f"• {r['display_name']}: {CURRENCY}{float(r['balance']):,.2f}")
-    await c.message.edit_text("\n".join(lines), reply_markup=main_kb()); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        month = cur_yyyymm(); total = monthly_total(OWNER_ID, month)
+        tb = top_balances(OWNER_ID, 5)
+        lines = [f"📊 <b>{month} Summary</b>",
+                 f"🧾 Personal Spend: <b>{CURRENCY}{total:,.2f}</b>"]
+        cats = monthly_by_category(OWNER_ID, month)
+        if cats:
+            lines.append("\n🏷️ By category:")
+            for r in cats:
+                lines.append(f"• {r['cat']}: {CURRENCY}{float(r['s']):,.2f}")
+        if tb:
+            lines.append("\n👥 Top balances:")
+            for r in tb:
+                lines.append(f"• {r['display_name']}: {CURRENCY}{float(r['balance']):,.2f}")
+        await c.message.edit_text("\n".join(lines), reply_markup=main_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ monthly error: {e}")
 
 @router.callback_query(F.data == "cat_chart")
 async def cb_cat_chart(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    png = render_category_chart_png(OWNER_ID, cur_yyyymm())
-    if not png:
-        return await c.message.answer("ℹ️ No data or chart engine unavailable.", reply_markup=main_kb())
-    await c.message.answer_photo(BufferedInputFile(png, filename="category_chart.png"),
-                                 caption="📉 Category chart (current month)",
-                                 reply_markup=main_kb())
-    await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        png = render_category_chart_png(OWNER_ID, cur_yyyymm())
+        if not png:
+            return await c.message.answer("ℹ️ No data or chart engine unavailable.", reply_markup=main_kb())
+        await c.message.answer_photo(BufferedInputFile(png, filename="category_chart.png"),
+                                     caption="📉 Category chart (current month)",
+                                     reply_markup=main_kb())
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ chart error: {e}")
 
 # Due Soon
 @router.callback_query(F.data == "due_soon")
 async def cb_due_soon(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    rows = due_items(OWNER_ID, 7)
-    if not rows:
-        txt = "✅ Nothing due in the next 7 days."
-    else:
-        parts = ["⏰ <b>Due Soon / Overdue</b>"]
-        for r in rows:
-            when = datetime.fromtimestamp(r["due_ts"], TZ).strftime("%d %b")
-            parts.append(f"• {r['name']}: {CURRENCY}{float(r['amount']):,.2f} — due {when}")
-        txt = "\n".join(parts)
-    await c.message.edit_text(txt, reply_markup=main_kb()); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        rows = due_items(OWNER_ID, 7)
+        if not rows:
+            txt = "✅ Nothing due in the next 7 days."
+        else:
+            parts = ["⏰ <b>Due Soon / Overdue</b>"]
+            for r in rows:
+                when = datetime.fromtimestamp(r["due_ts"], TZ).strftime("%d %b")
+                parts.append(f"• {r['name']}: {CURRENCY}{float(r['amount']):,.2f} — due {when}")
+            txt = "\n".join(parts)
+        await c.message.edit_text(txt, reply_markup=main_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ due soon error: {e}")
 
 # Reminders UI
 @router.callback_query(F.data == "reminders")
 async def cb_reminders(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    s = get_settings(OWNER_ID)
-    days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-    text = (f"🔔 <b>Reminders</b>\n"
-            f"Daily: {'ON' if s['daily_reminders'] else 'OFF'} at {s['daily_hour']:02d}:00 IST\n"
-            f"Weekly: {'ON' if s['weekly_reminders'] else 'OFF'} on {days[s['weekly_dow']]} (10:00 IST)")
-    await c.message.edit_text(text, reply_markup=reminders_kb()); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        s = get_settings(OWNER_ID)
+        days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+        text = (f"🔔 <b>Reminders</b>\n"
+                f"Daily: {'ON' if s['daily_reminders'] else 'OFF'} at {s['daily_hour']:02d}:00 IST\n"
+                f"Weekly: {'ON' if s['weekly_reminders'] else 'OFF'} on {days[s['weekly_dow']]} (10:00 IST)")
+        await c.message.edit_text(text, reply_markup=reminders_kb()); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ reminders error: {e}")
 
 @router.callback_query(F.data == "toggle_daily")
 async def toggle_daily(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    s = get_settings(OWNER_ID); newv = 0 if s["daily_reminders"] else 1
-    set_setting(OWNER_ID, "daily_reminders", newv)
-    await cb_reminders(c)
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        s = get_settings(OWNER_ID); newv = 0 if s["daily_reminders"] else 1
+        set_setting(OWNER_ID, "daily_reminders", newv)
+        await cb_reminders(c)
+    except Exception as e:
+        await c.message.answer(f"❌ toggle daily error: {e}")
 
 @router.callback_query(F.data == "toggle_weekly")
 async def toggle_weekly(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    s = get_settings(OWNER_ID); newv = 0 if s["weekly_reminders"] else 1
-    set_setting(OWNER_ID, "weekly_reminders", newv)
-    await cb_reminders(c)
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        s = get_settings(OWNER_ID); newv = 0 if s["weekly_reminders"] else 1
+        set_setting(OWNER_ID, "weekly_reminders", newv)
+        await cb_reminders(c)
+    except Exception as e:
+        await c.message.answer(f"❌ toggle weekly error: {e}")
 
 @router.callback_query(F.data == "set_daily_hour")
 async def ask_daily_hour(c: CallbackQuery, state: FSMContext):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    await state.set_state(DailyHourState.waiting_hour)
-    await c.message.edit_text("🕘 Send daily reminder hour (0-23 IST):", reply_markup=None); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await state.set_state(DailyHourState.waiting_hour)
+        await c.message.edit_text("🕘 Send daily reminder hour (0-23 IST):", reply_markup=None); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ set hour error: {e}")
 
 @router.message(DailyHourState.waiting_hour)
 async def set_daily_hour(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
     try:
-        h = int(m.text.strip()); assert 0 <= h <= 23
-    except Exception:
-        return await m.answer("⚠️ Send an integer from 0 to 23.")
-    set_setting(OWNER_ID, "daily_hour", h); await state.clear()
-    await m.answer("✅ Daily hour updated.", reply_markup=reminders_kb())
+        if not only_owner(m): return await m.answer(deny_text())
+        try:
+            h = int(m.text.strip()); assert 0 <= h <= 23
+        except Exception:
+            return await m.answer("⚠️ Send an integer from 0 to 23.")
+        set_setting(OWNER_ID, "daily_hour", h); await state.clear()
+        await m.answer("✅ Daily hour updated.", reply_markup=reminders_kb())
+    except Exception as e:
+        await m.answer(f"❌ set hour save error: {e}")
 
 @router.callback_query(F.data == "set_weekly_dow")
 async def ask_weekly_dow(c: CallbackQuery, state: FSMContext):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    await state.set_state(WeeklyDowState.waiting_dow)
-    await c.message.edit_text("📅 Send weekly day number (0=Mon .. 6=Sun):", reply_markup=None); await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await state.set_state(WeeklyDowState.waiting_dow)
+        await c.message.edit_text("📅 Send weekly day number (0=Mon .. 6=Sun):", reply_markup=None); await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ set dow error: {e}")
 
 @router.message(WeeklyDowState.waiting_dow)
 async def set_weekly_dow(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
     try:
-        d = int(m.text.strip()); assert 0 <= d <= 6
-    except Exception:
-        return await m.answer("⚠️ Send an integer from 0 to 6.")
-    set_setting(OWNER_ID, "weekly_dow", d); await state.clear()
-    await m.answer("✅ Weekly day updated.", reply_markup=reminders_kb())
+        if not only_owner(m): return await m.answer(deny_text())
+        try:
+            d = int(m.text.strip()); assert 0 <= d <= 6
+        except Exception:
+            return await m.answer("⚠️ Send an integer from 0 to 6.")
+        set_setting(OWNER_ID, "weekly_dow", d); await state.clear()
+        await m.answer("✅ Weekly day updated.", reply_markup=reminders_kb())
+    except Exception as e:
+        await m.answer(f"❌ set dow save error: {e}")
 
 # Undo
 @router.callback_query(F.data == "undo")
 async def cb_undo(c: CallbackQuery):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    msg = undo_last(OWNER_ID)
-    await c.message.answer(f"🧹 {msg}", reply_markup=main_kb()); await c.answer("Done")
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        msg = undo_last(OWNER_ID)
+        await c.message.answer(f"🧹 {msg}", reply_markup=main_kb()); await c.answer("Done")
+    except Exception as e:
+        await c.message.answer(f"❌ undo error: {e}")
 
 # ---------- IMPORT SHEET ----------
 @router.callback_query(F.data == "import_sheet")
 async def cb_import_sheet(c: CallbackQuery, state: FSMContext):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    await state.set_state(ImportState.waiting_file)
-    await c.message.edit_text(
-        "📥 <b>Import Sheet</b>\n"
-        "Upload a CSV or XLSX (export from Google Sheets).\n"
-        "Supported columns:\n"
-        "• Expenses: date, amount, note, category\n"
-        "• Ledger: person, type(lend|repay), amount, note, duedate\n"
-        "If type is missing: positive=lend, negative=repay.",
-        reply_markup=None
-    )
-    await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await state.set_state(ImportState.waiting_file)
+        await c.message.edit_text(
+            "📥 <b>Import Sheet</b>\n"
+            "Upload a CSV or XLSX (export from Google Sheets).\n"
+            "Supported columns:\n"
+            "• Expenses: date, amount, note, category\n"
+            "• Ledger: person, type(lend|repay), amount, note, duedate\n"
+            "If type is missing: positive=lend, negative=repay.",
+            reply_markup=None
+        )
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ import ui error: {e}")
 
 async def _download_document(doc: Document, dest: Path):
     file = await bot.get_file(doc.file_id)
@@ -1006,16 +1123,13 @@ def _to_float_safe(v) -> Optional[float]:
 async def _ingest_dataframe(df, results):
     cols = [str(c).strip() for c in df.columns]
     lower = [c.lower() for c in cols]
-    # Detect expense vs ledger
     has_person = any(c in lower for c in ["person","name"])
     has_amount = any(c in lower for c in ["amount","amt","value"])
     has_type = any(c in lower for c in ["type","tx_type","kind"])
     if not has_amount:
-        results["skipped"] += len(df)
-        return
+        results["skipped"] += len(df); return
 
     if not has_person:
-        # Treat as expenses
         c_amount = lower.index(_colexists(lower,"amount","amt","value"))
         c_date = lower.index(_colexists(lower,"date","datetime","time")) if _colexists(lower,"date","datetime","time") else None
         c_note = lower.index(_colexists(lower,"note","description","desc","remarks")) if _colexists(lower,"note","description","desc","remarks") else None
@@ -1024,14 +1138,12 @@ async def _ingest_dataframe(df, results):
             amt = _to_float_safe(row.iloc[c_amount]); 
             if (amt is None) or (amt == 0): 
                 results["skipped"] += 1; continue
-            # date not strictly used; DB stores now_ts, but yyyymm depends on now; acceptable
-            note = (str(row.iloc[c_note]).strip() if (c_note is not None and pd.notna(row.iloc[c_note])) else None) if HAS_PANDAS else (str(row.iloc[c_note]).strip() if c_note is not None else None)
+            note = (str(row.iloc[c_note]).strip() if (c_note is not None and (not HAS_PANDAS or pd.notna(row.iloc[c_note]))) else None)
             cat = (str(row.iloc[c_cat]).strip() if (c_cat is not None and (not HAS_PANDAS or pd.notna(row.iloc[c_cat]))) else None)
             eid = add_expense(OWNER_ID, amt, note, cat)
             log_action(OWNER_ID, "expense", "expenses", eid)
             results["expenses"] += 1
     else:
-        # Ledger
         c_person = lower.index(_colexists(lower,"person","name"))
         c_amount = lower.index(_colexists(lower,"amount","amt","value"))
         c_type = lower.index(_colexists(lower,"type","tx_type","kind")) if has_type else None
@@ -1068,61 +1180,66 @@ async def _ingest_dataframe(df, results):
 
 @router.message(ImportState.waiting_file, F.document)
 async def handle_import_file(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
-    doc = m.document
-    suffix = (doc.file_name or "").lower()
-    tmp_dir = Path("imports"); tmp_dir.mkdir(exist_ok=True)
-    dest = tmp_dir / f"{int(time.time())}_{doc.file_name}"
-    await _download_document(doc, dest)
-
-    results = {"expenses":0, "ledger":0, "skipped":0, "sheets":0}
     try:
-        if suffix.endswith(".csv"):
-            if not HAS_PANDAS:
-                return await m.answer("⚠️ Install pandas to import CSV/XLSX.")
-            df = pd.read_csv(dest)
-            await _ingest_dataframe(df, results); results["sheets"] = 1
-        elif suffix.endswith(".xlsx") or suffix.endswith(".xls"):
-            if not HAS_PANDAS:
-                return await m.answer("⚠️ Install pandas/openpyxl to import XLSX.")
-            x = pd.ExcelFile(dest)
-            for s in x.sheet_names:
-                df = x.parse(s)
-                await _ingest_dataframe(df, results)
-                results["sheets"] += 1
-        else:
-            return await m.answer("⚠️ Please upload a CSV or XLSX file.")
-    except Exception as e:
-        return await m.answer(f"❌ Import failed: {e}")
+        if not only_owner(m): return await m.answer(deny_text())
+        doc = m.document
+        suffix = (doc.file_name or "").lower()
+        tmp_dir = Path("imports"); tmp_dir.mkdir(exist_ok=True)
+        dest = tmp_dir / f"{int(time.time())}_{doc.file_name}"
+        await _download_document(doc, dest)
 
-    await state.clear()
-    month = cur_yyyymm()
-    total = monthly_total(OWNER_ID, month)
-    await m.answer(
-        f"✅ <b>Import complete</b>\n"
-        f"Sheets: {results['sheets']}\n"
-        f"Expenses added: {results['expenses']}\n"
-        f"Ledger rows added: {results['ledger']}\n"
-        f"Skipped rows: {results['skipped']}\n\n"
-        f"🧾 {month} spend: <b>{CURRENCY}{total:,.2f}</b>",
-        reply_markup=main_kb()
-    )
+        results = {"expenses":0, "ledger":0, "skipped":0, "sheets":0}
+        try:
+            if suffix.endswith(".csv"):
+                if not HAS_PANDAS:
+                    return await m.answer("⚠️ Install pandas to import CSV/XLSX.")
+                df = pd.read_csv(dest)
+                await _ingest_dataframe(df, results); results["sheets"] = 1
+            elif suffix.endswith(".xlsx") or suffix.endswith(".xls"):
+                if not HAS_PANDAS:
+                    return await m.answer("⚠️ Install pandas/openpyxl to import XLSX.")
+                x = pd.ExcelFile(dest)
+                for s in x.sheet_names:
+                    df = x.parse(s)
+                    await _ingest_dataframe(df, results)
+                    results["sheets"] += 1
+            else:
+                return await m.answer("⚠️ Please upload a CSV or XLSX file.")
+        except Exception as e:
+            return await m.answer(f"❌ Import failed: {e}")
+
+        await state.clear()
+        month = cur_yyyymm()
+        total = monthly_total(OWNER_ID, month)
+        await m.answer(
+            f"✅ <b>Import complete</b>\n"
+            f"Sheets: {results['sheets']}\n"
+            f"Expenses added: {results['expenses']}\n"
+            f"Ledger rows added: {results['ledger']}\n"
+            f"Skipped rows: {results['skipped']}\n\n"
+            f"🧾 {month} spend: <b>{CURRENCY}{total:,.2f}</b>",
+            reply_markup=main_kb()
+        )
+    except Exception as e:
+        await m.answer(f"❌ import handler error: {e}")
 
 # ---------- SUPPORT (AI) ----------
 @router.callback_query(F.data == "support_ai")
 async def cb_support_ai(c: CallbackQuery, state: FSMContext):
-    if not only_owner(c): return await c.message.answer(deny_text())
-    await state.set_state(SupportAIState.waiting_query)
-    await c.message.edit_text(
-        "🧑‍🤝‍🧑 <b>Support Assistant</b>\n"
-        "Ask me: ‘how much do I owe Ajay?’, ‘Ajay balance’, ‘monthly spend’, ‘due soon’, etc.",
-        reply_markup=None
-    )
-    await c.answer()
+    try:
+        if not only_owner(c): return await c.message.answer(deny_text())
+        await state.set_state(SupportAIState.waiting_query)
+        await c.message.edit_text(
+            "🧑‍🤝‍🧑 <b>Support Assistant</b>\n"
+            "Ask me: ‘how much do I owe Ajay?’, ‘Ajay balance’, ‘monthly spend’, ‘due soon’, etc.",
+            reply_markup=None
+        )
+        await c.answer()
+    except Exception as e:
+        await c.message.answer(f"❌ support ui error: {e}")
 
 def _nl_intent(q: str):
     s = q.strip().lower()
-    # person extraction
     m = re.search(r"balance\s+(?:of|for)\s+([a-z0-9 ._-]{2,})", s)
     if not m:
         m = re.search(r"owe\s+(?:to\s+)?([a-z0-9 ._-]{2,})", s)
@@ -1147,87 +1264,88 @@ async def ai_explain(prompt: str, base_reply: str, context: str) -> Optional[str
         return None
     try:
         api = SafoneAPI()
-        # Best-effort: try a 'chat' style method if it exists.
         if hasattr(api, "chat"):
             msg = f"Context:\n{context}\n\nUser question: {prompt}\nAnswer briefly."
-            resp = await api.chat(msg)  # library-specific; wrapped in try/except
+            resp = await api.chat(msg)
             text = getattr(resp, "results", None)
             if not text: text = str(resp)
             return f"{base_reply}\n\n🤖 {text}"
-        # If chat not available, skip silently.
         return None
     except Exception:
         return None
 
 @router.message(SupportAIState.waiting_query)
 async def handle_support_query(m: Message, state: FSMContext):
-    if not only_owner(m): return await m.answer(deny_text())
-    q = (m.text or "").strip()
-    intent, arg = _nl_intent(q)
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        q = (m.text or "").strip()
+        intent, arg = _nl_intent(q)
 
-    if intent == "monthly_spend":
-        month = cur_yyyymm()
-        total = monthly_total(OWNER_ID, month)
-        base = f"🧾 {month} spend: <b>{CURRENCY}{total:,.2f}</b>"
-        extra = await ai_explain(q, base, f"Monthly spend {month} is {total}")
-        await state.clear()
-        return await m.answer(extra or base, reply_markup=main_kb())
-
-    if intent == "due_soon":
-        rows = due_items(OWNER_ID, 7)
-        if not rows:
-            base = "✅ Nothing due in the next 7 days."
-        else:
-            parts = ["⏰ <b>Due Soon / Overdue</b>"]
-            for r in rows:
-                when = datetime.fromtimestamp(r["due_ts"], TZ).strftime("%d %b")
-                parts.append(f"• {r['name']}: {CURRENCY}{float(r['amount']):,.2f} — due {when}")
-            base = "\n".join(parts)
-        extra = await ai_explain(q, base, "Due soon list above.")
-        await state.clear()
-        return await m.answer(extra or base, reply_markup=main_kb())
-
-    if intent in ("balance_person","ledger_person") and arg:
-        pid = find_person_id(OWNER_ID, arg)
-        if not pid:
-            await state.clear()
-            return await m.answer(f"⚠️ Person “{arg}” not found.")
-        if intent == "balance_person":
-            bal = person_balance(OWNER_ID, pid)
-            if bal > 0:
-                base = f"📌 {arg.title()} owes you <b>{CURRENCY}{bal:,.2f}</b>."
-            elif bal < 0:
-                base = f"📌 You owe {arg.title()} <b>{CURRENCY}{abs(bal):,.2f}</b>."
-            else:
-                base = f"📌 You and {arg.title()} are settled (₹0)."
-            extra = await ai_explain(q, base, f"Balance with {arg} is {bal}")
+        if intent == "monthly_spend":
+            month = cur_yyyymm()
+            total = monthly_total(OWNER_ID, month)
+            base = f"🧾 {month} spend: <b>{CURRENCY}{total:,.2f}</b>"
+            extra = await ai_explain(q, base, f"Monthly spend {month} is {total}")
             await state.clear()
             return await m.answer(extra or base, reply_markup=main_kb())
-        else:
-            rows = get_ledger(OWNER_ID, pid)
+
+        if intent == "due_soon":
+            rows = due_items(OWNER_ID, 7)
             if not rows:
-                base = f"🗒 Ledger for <b>{arg.title()}</b> is empty."
+                base = "✅ Nothing due in the next 7 days."
             else:
-                last = rows[-10:]
-                lines = []
-                for r in last:
-                    dt = datetime.fromtimestamp(r["ts"], TZ).strftime("%d %b %H:%M")
-                    sym = {"lend":"➕","repay":"➖","interest":"➕"}[r["type"]]
-                    due = f" ⏰{datetime.fromtimestamp(r['due_ts'], TZ).strftime('%d %b')}" if r["due_ts"] else ""
-                    lines.append(f"{dt} {sym} {CURRENCY}{float(r['amount']):,.2f}{due} — {r['note']}")
-                bal = person_balance(OWNER_ID, pid)
-                base = (f"🗒 <b>{arg.title()}</b> (last {len(last)} of {len(rows)})\n" +
-                        "\n".join(lines) +
-                        f"\n\n💼 Balance: <b>{CURRENCY}{bal:,.2f}</b>")
-            extra = await ai_explain(q, base, f"Ledger shown for {arg}.")
+                parts = ["⏰ <b>Due Soon / Overdue</b>"]
+                for r in rows:
+                    when = datetime.fromtimestamp(r["due_ts"], TZ).strftime("%d %b")
+                    parts.append(f"• {r['name']}: {CURRENCY}{float(r['amount']):,.2f} — due {when}")
+                base = "\n".join(parts)
+            extra = await ai_explain(q, base, "Due soon list above.")
             await state.clear()
             return await m.answer(extra or base, reply_markup=main_kb())
 
-    # fallback
-    base = "🤖 I can answer: ‘monthly spend’, ‘due soon’, ‘Ajay balance’, or ‘ledger Ajay’."
-    extra = await ai_explain(q, base, "Help user with supported intents.")
-    await state.clear()
-    return await m.answer(extra or base, reply_markup=main_kb())
+        if intent in ("balance_person","ledger_person") and arg:
+            pid = find_person_id(OWNER_ID, arg)
+            if not pid:
+                await state.clear()
+                return await m.answer(f"⚠️ Person “{arg}” not found.")
+            if intent == "balance_person":
+                bal = person_balance(OWNER_ID, pid)
+                if bal > 0:
+                    base = f"📌 {arg.title()} owes you <b>{CURRENCY}{bal:,.2f}</b>."
+                elif bal < 0:
+                    base = f"📌 You owe {arg.title()} <b>{CURRENCY}{abs(bal):,.2f}</b>."
+                else:
+                    base = f"📌 You and {arg.title()} are settled (₹0)."
+                extra = await ai_explain(q, base, f"Balance with {arg} is {bal}")
+                await state.clear()
+                return await m.answer(extra or base, reply_markup=main_kb())
+            else:
+                rows = get_ledger(OWNER_ID, pid)
+                if not rows:
+                    base = f"🗒 Ledger for <b>{arg.title()}</b> is empty."
+                else:
+                    last = rows[-10:]
+                    lines = []
+                    for r in last:
+                        dt = datetime.fromtimestamp(r["ts"], TZ).strftime("%d %b %H:%M")
+                        sym = {"lend":"➕","repay":"➖","interest":"➕"}[r["type"]]
+                        due = f" ⏰{datetime.fromtimestamp(r['due_ts'], TZ).strftime('%d %b')}" if r["due_ts"] else ""
+                        lines.append(f"{dt} {sym} {CURRENCY}{float(r['amount']):,.2f}{due} — {r['note']}")
+                    bal = person_balance(OWNER_ID, pid)
+                    base = (f"🗒 <b>{arg.title()}</b> (last {len(last)} of {len(rows)})\n" +
+                            "\n".join(lines) +
+                            f"\n\n💼 Balance: <b>{CURRENCY}{bal:,.2f}</b>")
+                extra = await ai_explain(q, base, f"Ledger shown for {arg}.")
+                await state.clear()
+                return await m.answer(extra or base, reply_markup=main_kb())
+
+        base = "🤖 I can answer: ‘monthly spend’, ‘due soon’, ‘Ajay balance’, or ‘ledger Ajay’."
+        extra = await ai_explain(q, base, "Help user with supported intents.")
+        await state.clear()
+        return await m.answer(extra or base, reply_markup=main_kb())
+    except Exception as e:
+        await state.clear()
+        await m.answer(f"❌ support error: {e}", reply_markup=main_kb())
 
 # Quick-add parsers (keep last)
 NAME_SIGN_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9 ._-]{2,})\s+(?P<sign>[+-])\s*(?P<amt>\d+(?:\.\d{1,2})?)\s*(?P<note>.+)?$")
@@ -1235,54 +1353,57 @@ QUICK_RE = re.compile(r"^\s*(\d+(?:\.\d{1,2})?)\s*>\s*(add\s*to|lend\s*to|repay|
 
 @router.message()
 async def catch_all(m: Message):
-    if not only_owner(m): return await m.answer(deny_text())
-    txt = (m.text or "").strip()
-    if not txt: return
+    try:
+        if not only_owner(m): return await m.answer(deny_text())
+        txt = (m.text or "").strip()
+        if not txt: return
 
-    mm2 = NAME_SIGN_RE.match(txt)
-    if mm2:
-        name = mm2.group("name").strip()
-        sign = mm2.group("sign")
-        amt = float(mm2.group("amt"))
-        note = (mm2.group("note") or "").strip() or "quick-add"
-        pid = find_person_id(OWNER_ID, name)
-        if not pid:
-            return await m.answer("⚠️ Person not found. Add them first via 👥 People → ➕ Add Person.")
-        if sign == "+":
-            lid = add_ledger(OWNER_ID, pid, "lend", amt, note)
-            log_action(OWNER_ID, "ledger", "ledger", lid)
-            bal = person_balance(OWNER_ID, pid)
-            return await m.answer(f"✅ Lend {CURRENCY}{amt:,.2f} to <b>{name}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}",
-                                  reply_markup=people_kb(OWNER_ID))
-        else:
-            lid = add_ledger(OWNER_ID, pid, "repay", amt, note)
-            log_action(OWNER_ID, "ledger", "ledger", lid)
-            bal = person_balance(OWNER_ID, pid)
-            return await m.answer(f"✅ Repay {CURRENCY}{amt:,.2f} from <b>{name}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}",
-                                  reply_markup=people_kb(OWNER_ID))
+        mm2 = NAME_SIGN_RE.match(txt)
+        if mm2:
+            name = mm2.group("name").strip()
+            sign = mm2.group("sign")
+            amt = float(mm2.group("amt"))
+            note = (mm2.group("note") or "").strip() or "quick-add"
+            pid = find_person_id(OWNER_ID, name)
+            if not pid:
+                return await m.answer("⚠️ Person not found. Add them first via 👥 People → ➕ Add Person.")
+            if sign == "+":
+                lid = add_ledger(OWNER_ID, pid, "lend", amt, note)
+                log_action(OWNER_ID, "ledger", "ledger", lid)
+                bal = person_balance(OWNER_ID, pid)
+                return await m.answer(f"✅ Lend {CURRENCY}{amt:,.2f} to <b>{name}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}",
+                                      reply_markup=people_kb(OWNER_ID))
+            else:
+                lid = add_ledger(OWNER_ID, pid, "repay", amt, note)
+                log_action(OWNER_ID, "ledger", "ledger", lid)
+                bal = person_balance(OWNER_ID, pid)
+                return await m.answer(f"✅ Repay {CURRENCY}{amt:,.2f} from <b>{name}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}",
+                                      reply_markup=people_kb(OWNER_ID))
 
-    mm = QUICK_RE.match(txt)
-    if mm:
-        amount = float(mm.group(1))
-        action = mm.group(2).lower().replace(" ", "")
-        name = mm.group(3).strip()
-        pid = find_person_id(OWNER_ID, name)
-        if not pid:
-            return await m.answer("⚠️ Person not found. Add them first via 👥 People → ➕ Add Person.")
-        if "addto" in action or "lendto" in action:
-            lid = add_ledger(OWNER_ID, pid, "lend", amount, "quick-add")
-            log_action(OWNER_ID, "ledger", "ledger", lid)
-            bal = person_balance(OWNER_ID, pid)
-            return await m.answer(f"✅ Lend {CURRENCY}{amount:,.2f} to <b>{name}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}",
-                                  reply_markup=people_kb(OWNER_ID))
-        else:
-            lid = add_ledger(OWNER_ID, pid, "repay", amount, "quick-add")
-            log_action(OWNER_ID, "ledger", "ledger", lid)
-            bal = person_balance(OWNER_ID, pid)
-            return await m.answer(f"✅ Repay {CURRENCY}{amount:,.2f} from <b>{name}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}",
-                                  reply_markup=people_kb(OWNER_ID))
+        mm = QUICK_RE.match(txt)
+        if mm:
+            amount = float(mm.group(1))
+            action = mm.group(2).lower().replace(" ", "")
+            name = mm.group(3).strip()
+            pid = find_person_id(OWNER_ID, name)
+            if not pid:
+                return await m.answer("⚠️ Person not found. Add them first via 👥 People → ➕ Add Person.")
+            if "addto" in action or "lendto" in action:
+                lid = add_ledger(OWNER_ID, pid, "lend", amount, "quick-add")
+                log_action(OWNER_ID, "ledger", "ledger", lid)
+                bal = person_balance(OWNER_ID, pid)
+                return await m.answer(f"✅ Lend {CURRENCY}{amount:,.2f} to <b>{name}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}",
+                                      reply_markup=people_kb(OWNER_ID))
+            else:
+                lid = add_ledger(OWNER_ID, pid, "repay", amount, "quick-add")
+                log_action(OWNER_ID, "ledger", "ledger", lid)
+                bal = person_balance(OWNER_ID, pid)
+                return await m.answer(f"✅ Repay {CURRENCY}{amount:,.2f} from <b>{name}</b>\n💼 New balance: {CURRENCY}{bal:,.2f}",
+                                      reply_markup=people_kb(OWNER_ID))
 
-    await m.answer("Use the buttons below 👇", reply_markup=main_kb())
+        await m.answer("Use the buttons below 👇", reply_markup=main_kb())
+    except Exception as e:
+        await m.answer(f"❌ handler error: {e}", reply_markup=main_kb())
 
 # ---------- Background tasks: reminders + monthly interest ----------
 async def send_daily_summary():
@@ -1301,7 +1422,10 @@ async def send_daily_summary():
         lines.append("\n👥 Top balances:")
         for r in tb[:10]:
             lines.append(f"• {r['display_name']}: {CURRENCY}{float(r['balance']):,.2f}")
-    await bot.send_message(OWNER_ID, "\n".join(lines))
+    try:
+        await bot.send_message(OWNER_ID, "\n".join(lines))
+    except Exception:
+        pass
 
 async def send_weekly_digest():
     month = cur_yyyymm()
@@ -1312,7 +1436,10 @@ async def send_weekly_digest():
              "👥 Balances (top 20):"]
     for r in tb:
         lines.append(f"• {r['display_name']}: {CURRENCY}{float(r['balance']):,.2f}")
-    await bot.send_message(OWNER_ID, "\n".join(lines))
+    try:
+        await bot.send_message(OWNER_ID, "\n".join(lines))
+    except Exception:
+        pass
 
 async def apply_monthly_interest():
     yyyymm = cur_yyyymm()
@@ -1320,6 +1447,7 @@ async def apply_monthly_interest():
         rate = p["monthly_interest_rate"]
         if rate is None or rate <= 0:
             continue
+        # If already applied this month, skip
         if p["last_interest_yyyymm"] == yyyymm:
             continue
         bal = person_balance(OWNER_ID, p["id"])
@@ -1351,7 +1479,7 @@ async def scheduler_loop():
                     set_setting(OWNER_ID, "last_weekly_date", week_key)
         except Exception:
             pass
-        await asyncio.sleep(60)  # keep-as-is
+        await asyncio.sleep(60)  # simple heartbeat; low CPU
 
 # Proper startup/shutdown registration
 @dp.startup.register
@@ -1359,7 +1487,10 @@ async def on_startup():
     import asyncio
     init_db(); migrate_defaults()
     global SCHED_TASK
-    SCHED_TASK = asyncio.create_task(scheduler_loop())
+    try:
+        SCHED_TASK = asyncio.create_task(scheduler_loop())
+    except Exception:
+        SCHED_TASK = None
 
 @dp.shutdown.register
 async def on_shutdown():
@@ -1375,4 +1506,7 @@ async def on_shutdown():
 # ---------- Main ----------
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(dp.start_polling(bot))
+    try:
+        asyncio.run(dp.start_polling(bot))
+    except (KeyboardInterrupt, SystemExit):
+        pass
